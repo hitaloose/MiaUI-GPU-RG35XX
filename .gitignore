@@ -13,3 +13,5 @@ tools
 *.elf
 *.dtb
 *.zip
+perf-update/cache
+perf-update/output

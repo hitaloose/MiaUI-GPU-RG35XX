@@ -1,5 +1,10 @@
 # 🐱 MiaUI - MinUI + Koriki Hybrid for RG35XX (Old Model)
 
+> **This fork** adds a performance update for MiaUI v1.0.3 (PS1 at a steady 60 FPS, fixes that help
+> every system), installed over an existing setup with the Updater app. See
+> [perf-update/README.md](perf-update/README.md). Original project:
+> [DSkywalk/MiaUI-GPU-RG35XX](https://github.com/DSkywalk/MiaUI-GPU-RG35XX).
+
 MiaUI is the culmination of over 2 years of (interrupted) passionate development. This custom firmware was born from a simple goal: to bring the absolute best of [MinUI](https://github.com/shauninman/MinUI-Legacy-RG35XX) (its elegant, distraction-free interface) and [Koriki / Batocera](https://github.com/rg35xx-cfw/Koriki) (its raw hardware power) into a single distribution for the RG35XX legacy models.
 
 This is a heavily optimized, highly opinionated OS designed to maximize performance and unlock new emulators with an uncompromising approach to SD card preservation.
