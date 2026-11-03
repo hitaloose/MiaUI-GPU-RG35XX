@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds the MiaUI v1.0.3 performance update from this repo, on any host with Docker:
 #   perf-update/output/minarch.elf
+#   perf-update/output/minui.elf
 #   perf-update/output/pcsx_rearmed_libretro.so
-#   perf-update/output/miaui-v1.0.3-perf-ps1.zip   (Updater.pak, official update format)
+#   perf-update/output/miaui-v1.0.3-perf-collections.zip   (Updater.pak, official update format)
 #
 # The toolchain is Debian bookworm's arm-linux-gnueabihf gcc (glibc 2.36), so the binaries
 # load on MiaUI's glibc 2.37. Newer toolchains (glibc 2.38+) make binaries MiaUI can't load.

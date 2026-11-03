@@ -36,7 +36,17 @@ $CC minarch.c ../common/utils.c ../common/api.c ../platform/platform.c -o /out/m
 	-DBUILD_DATE=\"$(date +%Y.%m.%d)\" -DBUILD_HASH=\"$(git -C /repo rev-parse --short HEAD 2>/dev/null || echo perf)\" \
 	-L/b -lmsettings -lSDL2 -lSDL2_image -lSDL2_ttf -lEGL -lGLESv2 -lpthread -lm -lz -w
 
-for f in /out/minarch.elf /out/pcsx_rearmed_libretro.so; do
+# --- minui (launcher menu: collections picker) ---
+cd /b/src/minui
+$CC minui.c ../common/utils.c ../common/api.c ../platform/platform.c -o /out/minui.elf \
+	$ARCH -fomit-frame-pointer -DGL_VERTEX_SHADER -DSTBI_FAILURE_USERMSG \
+	-I. -I../common -I../platform -I../libmsettings -I/usr/include/SDL2 \
+	-DPLATFORM=\"rg35xx\" -DUSE_SDL2 -Os -std=gnu99 \
+	-DBUILD_DATE=\"$(date +%Y.%m.%d)\" -DBUILD_HASH=\"$(git -C /repo rev-parse --short HEAD 2>/dev/null || echo perf)\" \
+	-L/b -lmsettings -lSDL2 -lSDL2_image -lSDL2_ttf -lEGL -lGLESv2 -lpthread -lm -lz -ldl -w
+arm-linux-gnueabihf-strip /out/minui.elf
+
+for f in /out/minarch.elf /out/minui.elf /out/pcsx_rearmed_libretro.so; do
 	v=$(arm-linux-gnueabihf-readelf -V "$f" | grep -oE "GLIBC_2\.[0-9]+" | sort -uV | tail -1)
 	echo "$f needs $v (MiaUI has GLIBC_2.37)"
 done
@@ -46,10 +56,11 @@ done
 # entries, so extracting over / never changes directory modes or owners.
 rm -rf /stage && mkdir -p /stage/root/opt/minui/bin /stage/root/userdata/Cores /stage/zip/Updater.pak
 install -m 755 /out/minarch.elf /stage/root/opt/minui/bin/minarch.elf
+install -m 755 /out/minui.elf /stage/root/opt/minui/bin/minui.elf
 install -m 666 /out/pcsx_rearmed_libretro.so /stage/root/userdata/Cores/pcsx_rearmed_libretro.so
 cd /stage/root
 tar --numeric-owner --owner=1000 --group=100 --mtime='2026-10-31 12:00' -cf /stage/update.tar \
-	./opt/minui/bin/minarch.elf ./userdata/Cores/pcsx_rearmed_libretro.so
+	./opt/minui/bin/minarch.elf ./opt/minui/bin/minui.elf ./userdata/Cores/pcsx_rearmed_libretro.so
 gzip -n -9 /stage/update.tar
 CRC=$(python3 -c "import zlib,sys; print(format(zlib.crc32(open(sys.argv[1],'rb').read()) & 0xffffffff, '08x'))" /stage/update.tar.gz)
 cp /repo/skeleton/ROMS/Tools/Updater.pak/local_updater.py /stage/zip/Updater.pak/
@@ -58,7 +69,7 @@ printf '#!/bin/sh\n\ncd "$(dirname "$0")"\n\npython ./local_updater.py\n' > /sta
 chmod 755 /stage/zip/Updater.pak/launch.sh /stage/zip/Updater.pak/local_updater.py
 mv /stage/update.tar.gz /stage/zip/Updater.pak/update_$CRC.tar.gz
 cd /stage/zip
-rm -f /out/miaui-v1.0.3-perf-ps1.zip
-zip -q -r -X /out/miaui-v1.0.3-perf-ps1.zip Updater.pak
+rm -f /out/miaui-v1.0.3-perf-collections.zip
+zip -q -r -X /out/miaui-v1.0.3-perf-collections.zip Updater.pak
 echo "update_$CRC.tar.gz:"
 tar tvzf Updater.pak/update_$CRC.tar.gz

@@ -1,13 +1,13 @@
-# MiaUI v1.0.3 – Performance Update (PS1)
+# MiaUI v1.0.3 – Performance Update (PS1) + Collections
 
-An update for an existing MiaUI v1.0.3 install. No new image needed: it replaces two files
-through MiaUI's own Updater app.
+An update for an existing MiaUI v1.0.3 install. No new image needed: it replaces three files
+through MiaUI's own Updater app. It includes everything from the earlier `perf-ps1` update.
 
 ## Installation
 
-Requirement: MiaUI v1.0.3 already installed.
+Requirement: MiaUI v1.0.3 already installed (with or without the earlier `perf-ps1` update).
 
-1. Download and extract `miaui-v1.0.3-perf-ps1.zip`. It contains an `Updater.pak` folder.
+1. Download and extract `miaui-v1.0.3-perf-collections.zip`. It contains an `Updater.pak` folder.
 2. Copy the `Updater.pak` folder into the `Tools` folder of the card (ROMS partition, `/userdata/Tools`).
    - MiaUI's ROMS partition is ext4. On Windows, use a tool that can write ext4,
      or copy it over ADB (MiaUI's ADB app, in Tools):
@@ -17,12 +17,36 @@ Requirement: MiaUI v1.0.3 already installed.
 5. In a game, open the menu (MENU) → Options and check that **Prevent Tearing** is set to
    **Lenient** (the PS1 default; if you had switched it to Off, set it back to Lenient).
 
-Saves, states and settings are not touched. The update replaces only:
+Saves, states, settings and your collections are not touched. The update replaces only:
 
 - `/opt/minui/bin/minarch.elf`
+- `/opt/minui/bin/minui.elf`
 - `/userdata/Cores/pcsx_rearmed_libretro.so`
 
-## What's new
+## Collections from the game list
+
+Collections are the lists in **Collections** at the top of the main menu: each one is a
+`/userdata/Collections/<name>.txt` file with one ROM path per line (`/Roms/<system>/<file>`).
+Until now they could only be edited by hand. Now:
+
+- **Y on a game** (in any system, in Recently Played or inside a collection) opens the list
+  of collections, with a box checked on the ones that already have the game.
+  **A** adds or removes it (saved right away), **B** closes. A game can be in any number of
+  collections. The `Y LISTS` hint shows at the bottom when a game is selected.
+- **Default collections**: Backlog, Playing, Beaten and Abandoned are created (empty) when the
+  Collections folder has no list at all. Lists you already have are never changed.
+  Any `.txt` you add to the folder shows up in the Y list too.
+- Lists are written through a temporary file and renamed, so a power loss while saving
+  can't leave a list half written. Order is kept, new games go to the end.
+- **MENU + SELECT + START inside a collection now removes the game from that list only.**
+  This is MiaUI's hidden delete shortcut: elsewhere it still deletes the ROM file, but inside a
+  collection it used to delete the ROM too.
+
+This `minui.elf` is built from the current source, so it also brings the upstream minui changes
+made after the v1.0.3 image: the hidden delete shortcut above, a fix for MAME clone names and a
+small render optimization.
+
+## Performance (PS1)
 
 PS1 on MiaUI was slow (dropping to ~30 FPS) even though the hardware can keep up.
 The cause was in the frontend (minarch), not in the emulator. Fixes:
@@ -54,7 +78,7 @@ Needs Docker. From the repo root:
 ./perf-update/build.sh
 ```
 
-Output in `perf-update/output/`: `minarch.elf`, `pcsx_rearmed_libretro.so` and the
+Output in `perf-update/output/`: `minarch.elf`, `minui.elf`, `pcsx_rearmed_libretro.so` and the
 `Updater.pak` zip. The build uses Debian bookworm's `arm-linux-gnueabihf` gcc (glibc 2.36),
 because MiaUI ships glibc 2.37 and can't load binaries built against a newer glibc.
 The PCSX ReARMed commit is pinned in `cores/makefile` (`pcsx_rearmed_HASH`).
