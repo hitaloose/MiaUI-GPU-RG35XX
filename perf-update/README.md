@@ -26,13 +26,15 @@ Saves, states, settings and your collections are not touched. The update replace
 ## Collections from the game list
 
 Collections are the lists in **Collections** at the top of the main menu: each one is a
-`/userdata/Collections/<name>.txt` file with one ROM path per line (`/Roms/<system>/<file>`).
-Until now they could only be edited by hand. Now:
+`/userdata/Collections/<name>.txt` file with one path per line (`/Roms/<system>/<file>` for a
+ROM, `/Ports/<name>.pak` for a port). Until now they could only be edited by hand. Now:
 
-- **Y on a game** (in any system, in Recently Played or inside a collection) opens the list
+- **Y on a game or a port** (in any system, in Ports, in Recently Played or inside a collection) opens the list
   of collections, with a box checked on the ones that already have the game.
   **A** adds or removes it (saved right away), **B** closes. A game can be in any number of
   collections. The `Y LISTS` hint shows at the bottom when a game is selected.
+- A port opened from a collection brings you back to that collection when you quit it,
+  like ROMs already did.
 - **Default collections**: Backlog, Playing, Beaten and Abandoned are created (empty) when the
   Collections folder has no list at all. Lists you already have are never changed.
   Any `.txt` you add to the folder shows up in the Y list too.

@@ -875,9 +875,13 @@ static int picker_start = 0;
 static char *picker_game_path = NULL; // the game being added/removed
 static char *picker_game_name = NULL;
 
+// games: ROMs and ports (.pak folders in /Ports; Tools paks are left out)
 static int Picker_canOpen(Entry *entry)
 {
-    return entry && entry->type == ENTRY_ROM && Collection_relPath(entry->path);
+    if (!entry || !Collection_relPath(entry->path))
+        return 0;
+    return entry->type == ENTRY_ROM ||
+           (entry->type == ENTRY_PAK && prefixMatch(SDCARD_PATH "/Ports/", entry->path));
 }
 
 static int CollectionItem_sort(const void *a, const void *b)
@@ -1920,14 +1924,14 @@ static int autoResume(void)
     return 1;
 }
 
-static void openPak(char *path)
+static void openPak(char *path, char *last)
 {
     // NOTE: escapeSingleQuotes() modifies the passed string
     // so we need to save the path before we call that
     // if (prefixMatch(ROMS_PATH, path)) {
     //     addRecent(path);
     // }
-    saveLast(path);
+    saveLast(last == NULL ? path : last);
 
     char cmd[256];
     sprintf(cmd, "sh '%s/launch.sh'", escapeSingleQuotes(path));
@@ -2057,27 +2061,24 @@ static void closeDirectory(void)
 
 static void Entry_open(Entry *self)
 {
+    // opened from a collection: remember the collection, so the menu
+    // comes back to it (and not to the ROM's or port's own folder)
+    char *last = NULL;
+    char last_path[256];
+    if (prefixMatch(COLLECTIONS_PATH, top->path) && (self->type == ENTRY_ROM || self->type == ENTRY_PAK))
+    {
+        char *tmp = strrchr(self->path, '/');
+        snprintf(last_path, sizeof(last_path), "%s/%s", top->path, tmp ? tmp + 1 : self->path);
+        last = last_path;
+    }
+
     if (self->type == ENTRY_ROM)
     {
-        char *last = NULL;
-        if (prefixMatch(COLLECTIONS_PATH, top->path))
-        {
-            char *tmp;
-            char filename[256];
-
-            tmp = strrchr(self->path, '/');
-            if (tmp)
-                strcpy(filename, tmp + 1);
-
-            char last_path[256];
-            sprintf(last_path, "%s/%s", top->path, filename);
-            last = last_path;
-        }
         openRom(self->path, last);
     }
     else if (self->type == ENTRY_PAK)
     {
-        openPak(self->path);
+        openPak(self->path, last);
     }
     else if (self->type == ENTRY_DIR)
     {
