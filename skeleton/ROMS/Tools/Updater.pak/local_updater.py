@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import sys
 import subprocess
 import pygame
@@ -170,7 +171,11 @@ def run_update_process(t, archivo_tar):
 
             # /userdata/.../.off.Updater.pak
             new_path = os.path.join(folder_parent, ".off." + folder_name)
-            
+
+            # a previous update leaves its disabled copy here: rename can't replace a folder
+            if os.path.isdir(new_path):
+                shutil.rmtree(new_path)
+
             os.rename(current_dir, new_path)
         except Exception:
             log += t["log_err_rename"]

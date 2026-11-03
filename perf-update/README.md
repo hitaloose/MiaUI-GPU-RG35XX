@@ -13,7 +13,9 @@ Requirement: MiaUI v1.0.3 already installed (with or without the earlier `perf-p
      or copy it over ADB (MiaUI's ADB app, in Tools):
      `adb push Updater.pak /userdata/Tools/`
 3. On the console, open **Tools → Updater** and choose **Install Update**.
-4. Wait for `UPDATE COMPLETED SUCCESSFULLY` and press A. The Updater disables itself afterwards.
+4. Wait for `UPDATE COMPLETED SUCCESSFULLY` and press A. The Updater disables itself afterwards
+   (it now replaces the disabled copy a previous update left in Tools, which used to fail with
+   "Failed to rename Updater.pak folder").
 5. In a game, open the menu (MENU) → Options and check that **Prevent Tearing** is set to
    **Lenient** (the PS1 default; if you had switched it to Off, set it back to Lenient).
 
