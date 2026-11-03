@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <msettings.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -683,11 +684,385 @@ static void DirectoryArray_free(Array *self)
     }
     Array_free(self);
 }
+
+/**
+ * Removes the entry at index from the directory's list (memory only, the
+ * filesystem is not touched), re-indexes it and keeps selected/start/end valid.
+ */
+static void Directory_removeEntry(Directory *dir, int index)
+{
+    if (!dir || index < 0 || index >= dir->entries->count)
+        return;
+
+    Entry_free(dir->entries->items[index]);
+    for (int i = index; i < dir->entries->count - 1; i++)
+        dir->entries->items[i] = dir->entries->items[i + 1];
+    dir->entries->count--;
+
+    // Rebuild the alphabetical index to prevent crashes when using L1/R1
+    dir->alphas->count = 0;
+    Directory_index(dir);
+
+    int total = dir->entries->count;
+    if (total == 0)
+    {
+        dir->selected = 0;
+        dir->start = 0;
+        dir->end = 0;
+        return;
+    }
+    if (dir->selected >= total)
+        dir->selected = total - 1;
+    if (dir->end > total)
+    {
+        dir->end = total;
+        dir->start = (dir->end > MAIN_ROW_COUNT) ? dir->end - MAIN_ROW_COUNT : 0;
+    }
+}
+
+///////////////////////////////////////
+// Collections: /Collections/<name>.txt, one SD-relative ROM path per line.
+
+#define COLLECTION_TMP_PATH COLLECTIONS_PATH "/.collection.tmp"
+
+// path is a collection file (not the Collections folder itself)
+static int isCollectionFile(char *path)
+{
+    return prefixMatch(COLLECTIONS_PATH "/", path) && suffixMatch(".txt", path);
+}
+
+// "/userdata/Roms/x.zip" -> "/Roms/x.zip", NULL when not on the SD card
+static char *Collection_relPath(char *sd_path)
+{
+    if (!prefixMatch(SDCARD_PATH "/", sd_path))
+        return NULL;
+    return sd_path + strlen(SDCARD_PATH);
+}
+
+// Creates the default (empty) collections when the folder holds no collection
+// at all: fresh installs and updated cards get them, existing lists are never touched.
+static void Collection_seedDefaults(void)
+{
+    static char *defaults[] = {"Backlog", "Playing", "Beaten", "Abandoned", NULL};
+
+    mkdir(COLLECTIONS_PATH, 0777);
+    DIR *dh = opendir(COLLECTIONS_PATH);
+    if (!dh)
+        return;
+    int has_any = 0;
+    struct dirent *dp;
+    while (!has_any && (dp = readdir(dh)) != NULL)
+        has_any = !hide(dp->d_name) && suffixMatch(".txt", dp->d_name);
+    closedir(dh);
+    if (has_any)
+        return;
+
+    for (int i = 0; defaults[i]; i++)
+    {
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s/%s.txt", COLLECTIONS_PATH, defaults[i]);
+        FILE *file = fopen(path, "w");
+        if (file)
+        {
+            fchmod(fileno(file), 0666);
+            fclose(file);
+        }
+    }
+    sync();
+}
+
+static int Collection_has(char *collection_path, char *sd_path)
+{
+    char *rel = Collection_relPath(sd_path);
+    if (!rel)
+        return 0;
+
+    int found = 0;
+    FILE *file = fopen(collection_path, "r");
+    if (!file)
+        return 0;
+
+    char line[MAX_PATH];
+    while (!found && fgets(line, sizeof(line), file) != NULL)
+    {
+        normalizeNewline(line);
+        trimTrailingNewlines(line);
+        found = exactMatch(line, rel);
+    }
+    fclose(file);
+    return found;
+}
+
+/**
+ * Adds (member=1) or removes (member=0) a game from a collection file.
+ * Rewrites the file through a temp file + rename so a power loss mid-write
+ * never leaves a truncated list. Existing order is kept, new games go last.
+ * Returns 1 on success.
+ */
+static int Collection_set(char *collection_path, char *sd_path, int member)
+{
+    char *rel = Collection_relPath(sd_path);
+    if (!rel)
+        return 0;
+
+    FILE *out = fopen(COLLECTION_TMP_PATH, "w");
+    if (!out)
+        return 0;
+
+    int found = 0;
+    FILE *in = fopen(collection_path, "r");
+    if (in)
+    {
+        char line[MAX_PATH];
+        while (fgets(line, sizeof(line), in) != NULL)
+        {
+            normalizeNewline(line);
+            trimTrailingNewlines(line);
+            if (strlen(line) == 0)
+                continue;
+            if (exactMatch(line, rel))
+            {
+                if (member && !found)
+                    fprintf(out, "%s\n", line); // keep its position, drop duplicates
+                found = 1;
+                continue;
+            }
+            fprintf(out, "%s\n", line);
+        }
+        fclose(in);
+    }
+    if (member && !found)
+        fprintf(out, "%s\n", rel);
+
+    // the temp file replaces the original: keep its owner and mode
+    // (lists written over ADB or a PC are usually rw-rw-rw-)
+    struct stat st;
+    if (stat(collection_path, &st) == 0)
+    {
+        fchmod(fileno(out), st.st_mode & 07777);
+        fchown(fileno(out), st.st_uid, st.st_gid);
+    }
+    else
+        fchmod(fileno(out), 0666);
+
+    int ok = fflush(out) == 0 && fsync(fileno(out)) == 0;
+    ok = (fclose(out) == 0) && ok;
+    if (!ok || rename(COLLECTION_TMP_PATH, collection_path) != 0)
+    {
+        remove(COLLECTION_TMP_PATH);
+        return 0;
+    }
+    sync();
+    return 1;
+}
+
+///////////////////////////////////////
+// Collection picker (Y on a game): toggle the game in one or more collections.
+
+#define PICKER_ROWS (MAIN_ROW_COUNT - 1) // first row is the game title
+
+typedef struct CollectionItem
+{
+    char *path;
+    char *name;
+    int member;
+} CollectionItem;
+
+static int show_picker = 0;
+static Array *picker_items = NULL;    // CollectionItem*
+static int picker_selected = 0;
+static int picker_start = 0;
+static char *picker_game_path = NULL; // the game being added/removed
+static char *picker_game_name = NULL;
+
+static int Picker_canOpen(Entry *entry)
+{
+    return entry && entry->type == ENTRY_ROM && Collection_relPath(entry->path);
+}
+
+static int CollectionItem_sort(const void *a, const void *b)
+{
+    CollectionItem *item1 = *(CollectionItem **)a;
+    CollectionItem *item2 = *(CollectionItem **)b;
+    return strcasecmp(item1->name, item2->name);
+}
+
+// Reads the collection list from disk every time, so collections created
+// later (by hand or by a future "new collection" option) just show up.
+static void Picker_open(Entry *entry)
+{
+    picker_items = Array_new();
+    picker_selected = 0;
+    picker_start = 0;
+    picker_game_path = strdup(entry->path);
+    picker_game_name = strdup(entry->unique ? entry->unique : entry->name);
+
+    DIR *dh = opendir(COLLECTIONS_PATH);
+    if (dh)
+    {
+        struct dirent *dp;
+        while ((dp = readdir(dh)) != NULL)
+        {
+            if (hide(dp->d_name) || !suffixMatch(".txt", dp->d_name))
+                continue;
+
+            char path[MAX_PATH];
+            snprintf(path, sizeof(path), "%s/%s", COLLECTIONS_PATH, dp->d_name);
+            if (!exists(path))
+                continue;
+
+            char name[256];
+            getDisplayName(path, name);
+
+            CollectionItem *item = malloc(sizeof(CollectionItem));
+            item->path = strdup(path);
+            item->name = strdup(name);
+            item->member = Collection_has(path, picker_game_path);
+            Array_push(picker_items, item);
+        }
+        closedir(dh);
+    }
+    qsort(picker_items->items, picker_items->count, sizeof(void *), CollectionItem_sort);
+    show_picker = 1;
+}
+
+// Closes the picker. If the game was removed from the collection currently
+// open on screen, it is removed from that list too.
+static void Picker_close(Directory *current)
+{
+    int removed_from_current = 0;
+    for (int i = 0; i < picker_items->count; i++)
+    {
+        CollectionItem *item = picker_items->items[i];
+        if (!item->member && exactMatch(item->path, current->path))
+            removed_from_current = 1;
+        free(item->path);
+        free(item->name);
+        free(item);
+    }
+    Array_free(picker_items);
+    picker_items = NULL;
+
+    if (removed_from_current)
+    {
+        int index = EntryArray_indexOf(current->entries, picker_game_path);
+        if (index >= 0)
+            Directory_removeEntry(current, index);
+    }
+
+    free(picker_game_path);
+    free(picker_game_name);
+    picker_game_path = NULL;
+    picker_game_name = NULL;
+    show_picker = 0;
+}
+
+static void Picker_toggle(void)
+{
+    if (picker_items->count == 0)
+        return;
+    CollectionItem *item = picker_items->items[picker_selected];
+    if (Collection_set(item->path, picker_game_path, !item->member))
+        item->member = !item->member;
+}
+
+// returns 1 when the screen needs a redraw
+static int Picker_move(int delta)
+{
+    int count = picker_items->count;
+    if (count == 0)
+        return 0;
+
+    picker_selected = (picker_selected + delta + count) % count;
+    if (picker_selected < picker_start)
+        picker_start = picker_selected;
+    else if (picker_selected >= picker_start + PICKER_ROWS)
+        picker_start = picker_selected - PICKER_ROWS + 1;
+    return 1;
+}
+
+// width GFX_blitButtonGroup draws for these {button, hint, ..., NULL} pairs (max 2)
+static int hintGroupWidth(char **pairs)
+{
+    int w = SCALE1(BUTTON_MARGIN);
+    for (int i = 0; i < 2 && pairs[i * 2]; i++)
+        w += GFX_getButtonWidth(pairs[i * 2 + 1], pairs[i * 2]) + SCALE1(BUTTON_MARGIN);
+    return w;
+}
+
+static void Picker_blitCheckbox(SDL_Surface *dst, int x, int y, int checked, SDL_Color c)
+{
+    Uint32 color = SDL_MapRGB(dst->format, c.r, c.g, c.b);
+    int s = SCALE1(9);
+    int t = FIXED_SCALE; // 1pt border
+    SDL_FillRect(dst, &(SDL_Rect){x, y, s, t}, color);
+    SDL_FillRect(dst, &(SDL_Rect){x, y + s - t, s, t}, color);
+    SDL_FillRect(dst, &(SDL_Rect){x, y, t, s}, color);
+    SDL_FillRect(dst, &(SDL_Rect){x + s - t, y, t, s}, color);
+    if (checked)
+        SDL_FillRect(dst, &(SDL_Rect){x + 2 * t, y + 2 * t, s - 4 * t, s - 4 * t}, color);
+}
+
+static void Picker_render(SDL_Surface *dst, int hardware_w)
+{
+    char text_buf[256];
+    int text_x = SCALE1(PADDING + BUTTON_PADDING);
+
+    // title: the game's name, dimmed like a header
+    char title[256];
+    snprintf(title, sizeof(title), "%s", picker_game_name);
+    char *title_name = title;
+    trimSortingMeta(&title_name);
+    int title_w = dst->w - SCALE1(PADDING * 2) - hardware_w;
+    GFX_truncateText(font.large, title_name, text_buf, title_w, SCALE1(BUTTON_PADDING * 2));
+    SDL_Surface *text = TTF_RenderUTF8_Blended(font.large, text_buf, COLOR_DARK_TEXT);
+    SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){text_x, SCALE1(PADDING + 4)});
+    SDL_FreeSurface(text);
+
+    if (picker_items->count == 0)
+    {
+        GFX_blitMessage(font.large, "No collections found\nin /Collections", dst,
+                        &(SDL_Rect){0, 0, dst->w, dst->h});
+    }
+
+    int box = SCALE1(9);
+    int label_x = text_x + box + SCALE1(6);
+    int max_w = dst->w - SCALE1(PADDING * 2);
+    for (int i = picker_start, j = 1; i < picker_items->count && j <= PICKER_ROWS; i++, j++)
+    {
+        CollectionItem *item = picker_items->items[i];
+        int y = SCALE1(PADDING + j * PILL_SIZE);
+        int is_selected = i == picker_selected;
+        SDL_Color color = is_selected ? COLOR_BLACK : COLOR_WHITE;
+
+        int label_w = GFX_truncateText(font.large, item->name, text_buf, max_w - (label_x - text_x), SCALE1(BUTTON_PADDING * 2));
+        if (is_selected)
+            GFX_blitPill(ASSET_WHITE_PILL, dst, &(SDL_Rect){SCALE1(PADDING), y, (label_x - text_x) + label_w, SCALE1(PILL_SIZE)});
+
+        Picker_blitCheckbox(dst, text_x, y + (SCALE1(PILL_SIZE) - box) / 2, item->member, color);
+
+        text = TTF_RenderUTF8_Blended(font.large, text_buf, color);
+        SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){label_x, y + SCALE1(4)});
+        SDL_FreeSurface(text);
+    }
+
+    if (picker_items->count > 0)
+    {
+        CollectionItem *item = picker_items->items[picker_selected];
+        GFX_blitButtonGroup((char *[]){"B", "BACK", "A", item->member ? "REMOVE" : "ADD", NULL}, 1, dst, 1);
+    }
+    else
+    {
+        GFX_blitButtonGroup((char *[]){"B", "BACK", NULL}, 0, dst, 1);
+    }
+}
+
 ///////////////////////////////////////
 
 /**
  * Deletes the file associated with the given entry from the filesystem,
  * removes it from the directory's entry list, and re-indexes the directory.
+ * Inside a collection only the collection's line is removed: the ROM stays.
  *
  * @param dir Pointer to the Directory object.
  * @param index The index of the entry to be deleted.
@@ -698,33 +1073,31 @@ static int deleteCurrentEntry(Directory *dir, int index)
         return 0;
 
     Entry *entry = dir->entries->items[index];
-
-    // 1. Delete the actual file from the filesystem
-    if (remove(entry->path) != 0) {
-        printf("Error deleting file: %s\n", entry->path);
-        // If the filesystem prevents deletion, we abort removing it from the UI
-        return 0;
-    }
-
-    // Prepare the UI message based on the result
     char msg[256];
-    snprintf(msg, sizeof(msg), "Deleted: %s", entry->name);
 
-    // 2. Free the memory allocated for this specific entry
-    if (entry->path) free(entry->path);
-    if (entry->name) free(entry->name);
-    if (entry->unique) free(entry->unique);
-    free(entry);
-
-    // 3. Shift the remaining entries in the array to fill the gap
-    for (int i = index; i < dir->entries->count - 1; i++) {
-        dir->entries->items[i] = dir->entries->items[i + 1];
+    if (isCollectionFile(dir->path))
+    {
+        // 1. Remove the game from this collection only, never the ROM itself
+        if (!Collection_set(dir->path, entry->path, 0))
+        {
+            printf("Error removing from collection: %s\n", entry->path);
+            return 0;
+        }
+        snprintf(msg, sizeof(msg), "Removed: %s", entry->name);
     }
-    dir->entries->count--;
+    else
+    {
+        // 1. Delete the actual file from the filesystem
+        if (remove(entry->path) != 0) {
+            printf("Error deleting file: %s\n", entry->path);
+            // If the filesystem prevents deletion, we abort removing it from the UI
+            return 0;
+        }
+        snprintf(msg, sizeof(msg), "Deleted: %s", entry->name);
+    }
 
-    // 4. Clear and rebuild the alphabetical index to prevent crashes when using L1/R1
-    dir->alphas->count = 0;
-    Directory_index(dir);
+    // 2-4. Free the entry, close the gap and rebuild the index
+    Directory_removeEntry(dir, index);
 
     // Render the message directly to the screen
     SDL_Surface *notif_txt = TTF_RenderUTF8_Blended(font.large, msg, COLOR_LIGHT_RED);
@@ -1809,6 +2182,7 @@ static void Menu_init(void)
     stack = Array_new(); // array of open Directories
     recents = Array_new();
 
+    Collection_seedDefaults();
     openDirectory(SDCARD_PATH, 0);
     loadLast(); // restore state when available
 }
@@ -1883,7 +2257,31 @@ int main(int argc, char *argv[])
             dirty = 1;
         was_online = is_online;
 
-        if (show_version)
+        if (show_picker)
+        {
+            if (PAD_justPressed(BTN_B))
+            {
+                Picker_close(top);
+                total = top->entries->count;
+                dirty = 1;
+                if (total > 0)
+                    readyResume(top->entries->items[top->selected]);
+            }
+            else if (PAD_justPressed(BTN_A))
+            {
+                Picker_toggle();
+                dirty = 1;
+            }
+            else if (PAD_justRepeated(BTN_UP))
+            {
+                dirty |= Picker_move(-1);
+            }
+            else if (PAD_justRepeated(BTN_DOWN))
+            {
+                dirty |= Picker_move(1);
+            }
+        }
+        else if (show_version)
         {
             if (PAD_justPressed(BTN_B) || PAD_tappedMenu(now))
             {
@@ -1917,25 +2315,10 @@ int main(int argc, char *argv[])
                     if (!success)
                         continue;
 
-                    // Update cursor and pagination bounds after deletion
+                    // Cursor and pagination bounds were fixed by Directory_removeEntry
                     total = top->entries->count;
-                    if (total == 0) 
-                    {
-                        selected = 0;
-                        top->start = 0;
-                        top->end = 0;
-                    } 
-                    else 
-                    {
-                        if (selected >= total) selected = total - 1;
-                        
-                        if (top->end > total) 
-                        {
-                            top->end = total;
-                            top->start = (top->end > MAIN_ROW_COUNT) ? top->end - MAIN_ROW_COUNT : 0;
-                        }
-                    }
-                    
+                    selected = top->selected;
+
                     // Reset the input timer to prevent skipped frames from jumping the cursor
                     update_timer = SDL_GetTicks(); 
                     dirty = 1; // Force a full UI redraw for the next iteration
@@ -2088,6 +2471,11 @@ int main(int argc, char *argv[])
                 if (total > 0)
                     readyResume(top->entries->items[top->selected]);
             }
+            else if (total > 0 && PAD_justPressed(BTN_Y) && Picker_canOpen(top->entries->items[top->selected]))
+            {
+                Picker_open(top->entries->items[top->selected]);
+                dirty = 1;
+            }
             else if (PAD_justPressed(BTN_B) && stack->count > 1)
             {
                 update_timer = now;
@@ -2229,7 +2617,13 @@ int main(int argc, char *argv[])
             // int oy; // --
             int ow = GFX_blitHardwareGroup(screen, show_setting);
 
-            if (show_version)
+            if (show_picker)
+            {
+                Picker_render(screen, ow);
+                if (show_setting && !GetHDMI())
+                    GFX_blitHardwareHints(screen, show_setting);
+            }
+            else if (show_version)
             {
                 if (!version)
                 {
@@ -2392,16 +2786,40 @@ int main(int argc, char *argv[])
                 }
 
                 // buttons
+                // Y LISTS is shown next to RESUME or MENU INFO when both groups
+                // still fit on one line; otherwise RESUME wins over Y, Y over INFO.
+                int can_collect = total > 0 && Picker_canOpen(top->entries->items[top->selected]);
+                char *left_hints[5] = {NULL};
+                if (can_resume)
+                {
+                    left_hints[0] = "X";
+                    left_hints[1] = "RESUME";
+                }
+                else
+                {
+                    left_hints[0] = BTN_SLEEP == BTN_POWER ? "POWER" : "MENU";
+                    left_hints[1] = BTN_SLEEP == BTN_POWER || simple_mode ? "SLEEP" : "INFO";
+                }
+                if (can_collect)
+                {
+                    left_hints[2] = "Y";
+                    left_hints[3] = "LISTS";
+                    char *right_hints[] = {"B", "BACK", "A", "OPEN", NULL};
+                    int fits = hintGroupWidth(left_hints) + hintGroupWidth(stack->count > 1 ? right_hints : right_hints + 2) + SCALE1(PADDING * 3) <= screen->w;
+                    if (!fits && can_resume)
+                        left_hints[2] = NULL;
+                    else if (!fits)
+                    {
+                        left_hints[0] = "Y";
+                        left_hints[1] = "LISTS";
+                        left_hints[2] = NULL;
+                    }
+                }
+
                 if (show_setting && !GetHDMI())
                     GFX_blitHardwareHints(screen, show_setting);
-                else if (can_resume)
-                    GFX_blitButtonGroup((char *[]){"X", "RESUME", NULL}, 0, screen, 0);
                 else
-                    GFX_blitButtonGroup((char *[]){
-                                            BTN_SLEEP == BTN_POWER ? "POWER" : "MENU",
-                                            BTN_SLEEP == BTN_POWER || simple_mode ? "SLEEP" : "INFO",
-                                            NULL},
-                                        0, screen, 0);
+                    GFX_blitButtonGroup(left_hints, 0, screen, 0);
 
                 if (total == 0)
                 {
