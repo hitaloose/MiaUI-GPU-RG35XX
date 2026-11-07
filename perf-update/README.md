@@ -63,8 +63,10 @@ The cause was in the frontend (minarch), not in the emulator. Fixes:
   ~6 ms of the 16.6 ms budget. It is now drawn only in the menu or with the debug HUD on.
   This helps every system, not just PS1.
 - **No more periodic hitch.**
-  The RG35XX screen runs at 60.46 Hz and games at 60 Hz. The difference filled the audio
-  buffer and made the game skip a frame every ~2 seconds. Audio now follows the screen's rate.
+  The RG35XX screen runs at 60.46 Hz, not 60, while games run at their own ~60 Hz. The
+  difference filled the audio buffer and made the game skip a frame every ~2 seconds. The
+  screen's rate is now measured while you play (vsync periods over ~2 s windows, integer
+  math only) and the audio input rate follows it, instead of a rate fixed in the code.
 - **PCSX ReARMed updated (r23 from 2023 → r26 from 2026).**
   Adds threaded GPU rendering and the recent dynarec improvements.
 

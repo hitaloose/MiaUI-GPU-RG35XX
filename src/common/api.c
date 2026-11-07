@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <msettings.h>
 
@@ -205,7 +206,6 @@ int GFX_hdmiChanged(void) {
 }
 
 #define FRAME_BUDGET 17 // 60fps
-#define PANEL_HZ_X100 6046 // RG35XX panel refresh, measured (vsync interrupt and Lenient fps)
 static uint32_t frame_start = 0;
 void GFX_startFrame(void) {
     frame_start = SDL_GetTicks();
@@ -215,9 +215,61 @@ void GFX_startFrame(void) {
  * Flips the video buffer.
  * Handles VSync logic if strict vsync is enabled.
  */
+static void SND_panelRate(uint32_t hz_x1000);
+
+// The panel refresh rate, measured while vsync is on. It is not exactly 60 Hz (60.46 Hz on
+// the RG35XX), a ~60 fps core under vsync runs at that rate, and the audio input rate
+// follows it (SND_panelRate) instead of a value fixed at build time.
+// Integer math only: cores like PCSX ReARMed leave the VFP registers dirty, so doubles
+// computed here while a game runs can come out as nan.
+#define PANEL_WINDOW 120        // vsync periods per measurement (~2 s)
+#define PANEL_MAX_GAP_US 100000 // longer between flips (loading, menu stall): restart the window
+static struct {
+    uint64_t last_us;   // previous vsync flip, 0 = none
+    uint64_t win_us;    // time and vsync periods in the current window
+    uint32_t win_periods;
+    uint32_t hz_x1000;  // smoothed estimate, 0 = not measured yet
+    uint32_t period_us; // vsync period used to count periods per flip
+} panel = {0, 0, 0, 0, 16667};
+
+static uint64_t panel_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
+}
+static void panel_track(int vsynced) {
+    uint64_t now = panel_now_us();
+    if (!vsynced) { // a flip that did not wait breaks the cadence
+        panel.last_us = 0;
+        panel.win_us = panel.win_periods = 0;
+        return;
+    }
+    uint64_t gap = panel.last_us ? now - panel.last_us : 0;
+    panel.last_us = now;
+    // Count vsync periods, not flips: a frame that missed vsync took 2 periods. Counting
+    // flips, one miss per 2 s window reads a 60.46 Hz panel as 59.96 Hz.
+    uint32_t periods = (uint32_t)((gap + panel.period_us / 2) / panel.period_us);
+    if (gap == 0 || gap > PANEL_MAX_GAP_US || periods == 0) {
+        panel.win_us = panel.win_periods = 0;
+        return;
+    }
+    panel.win_us += gap;
+    panel.win_periods += periods;
+    if (panel.win_periods < PANEL_WINDOW) return;
+
+    uint32_t hz = (uint32_t)((uint64_t)panel.win_periods * 1000000000u / panel.win_us);
+    panel.win_us = panel.win_periods = 0;
+    if (hz < 50000 || hz > 70000) return; // not a ~60 Hz cadence (swap not waiting)
+    panel.hz_x1000 = panel.hz_x1000 ? (panel.hz_x1000 * 3 + hz) / 4 : hz;
+    panel.period_us = 1000000000u / panel.hz_x1000;
+    SND_panelRate(panel.hz_x1000);
+}
+
 void GFX_flip(SDL_Surface* screen) {
     int should_vsync = (gfx.vsync!=VSYNC_OFF && (gfx.vsync==VSYNC_STRICT || frame_start==0 || SDL_GetTicks()-frame_start<FRAME_BUDGET));
     PLAT_flip(screen, should_vsync);
+    panel_track(should_vsync);
+    if (gfx.vsync==VSYNC_OFF) SND_panelRate(0); // audio-paced: play at the core's own rate
 }
 
 /**
@@ -916,6 +968,8 @@ typedef int (*SND_Resampler)(const SND_Frame frame);
 static struct SND_Context {
     int initialized;
     double frame_rate;
+    int fps_x1000;        // the core's frame rate (integer copy, see panel_track)
+    int base_rate_in;     // the core's sample rate; sample_rate_in is it scaled to the panel
     
     int sample_rate_in;
     int sample_rate_out;
@@ -1005,6 +1059,29 @@ static void SND_selectResampler(void) { // plat_sound_select_resampler
         snd.resample = SND_resampleNear;
     }
 }
+// With vsync a core runs at the panel's rate, not its own: a 60 fps core on a 60.46 Hz panel
+// makes 0.8% more audio than the card plays (the buffer fills and frames wait on it), on a
+// slower one less (underruns, pops). Scale the input rate by panel/core so the
+// resampler drops or repeats that difference. Only for cores within 3% of the panel rate
+// (a 50 Hz core is not paced by it). hz_x1000 = 0 restores the core's own rate.
+// Runs on the emulation thread, like the resampler, so it needs no lock.
+static void SND_panelRate(uint32_t hz_x1000) {
+    if (!snd.initialized || snd.fps_x1000 <= 0) return;
+    int rate = snd.base_rate_in;
+    if (hz_x1000) {
+        int64_t diff = (int64_t)hz_x1000 - snd.fps_x1000;
+        if (diff < 0) diff = -diff;
+        if (diff * 100 <= (int64_t)snd.fps_x1000 * 3)
+            rate = (int)((int64_t)snd.base_rate_in * hz_x1000 / snd.fps_x1000);
+    }
+    if (rate == snd.sample_rate_in) return;
+    int logged = rate - snd.sample_rate_in > 8 || snd.sample_rate_in - rate > 8 || !hz_x1000;
+    snd.sample_rate_in = rate;
+    SND_selectResampler();
+    if (logged) LOG_info("SND: panel %u mHz, core %i mHz: input rate %i (core %i)\n",
+                         hz_x1000, snd.fps_x1000, rate, snd.base_rate_in);
+}
+
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_sound_write / plat_sound_write_resample
     if (snd.frame_count==0) return 0;
     
@@ -1067,20 +1144,13 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
     
     snd.buffer_seconds = 5;
     snd.sample_rate_in  = sample_rate;
-    // The panel refreshes at 60.46 Hz (measured), so with vsync a ~60 fps core runs at
-    // 60.46 fps and makes ~0.8% more audio than the card plays: the buffer fills and a
-    // frame misses vsync every ~2 s. Scale the input rate so the resampler drops that excess.
-    {
-        int fps100 = (int)(frame_rate * 100 + 0.5);
-        if (fps100 > 5850 && fps100 < 6150) {
-            snd.sample_rate_in = (int)((int64_t)(int)sample_rate * PANEL_HZ_X100 / fps100);
-            LOG_info("SND_init: %i fps x100 core on a %i x100 Hz panel: input rate %i\n", fps100, PANEL_HZ_X100, snd.sample_rate_in);
-        }
-    }
+    snd.base_rate_in    = sample_rate;
+    snd.fps_x1000       = (int)(frame_rate * 1000 + 0.5);
     snd.sample_rate_out = spec_out.freq;
     
     SND_selectResampler();
     SND_resizeBuffer();
+    if (panel.hz_x1000) SND_panelRate(panel.hz_x1000); // already measured (menus before the game)
     
     SDL_PauseAudio(0);
 
