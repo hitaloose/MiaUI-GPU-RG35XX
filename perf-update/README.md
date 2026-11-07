@@ -1,13 +1,13 @@
-# MiaUI v1.0.3 – Performance Update (PS1) + Collections
+# MiaUI v1.0.3 – Performance Update (PS1, audio) + Collections
 
 An update for an existing MiaUI v1.0.3 install. No new image needed: it replaces three files
-through MiaUI's own Updater app. It includes everything from the earlier `perf-ps1` update.
+through MiaUI's own Updater app. It includes everything from the earlier `perf-ps1` and `perf-collections` updates.
 
 ## Installation
 
-Requirement: MiaUI v1.0.3 already installed (with or without the earlier `perf-ps1` update).
+Requirement: MiaUI v1.0.3 already installed (with or without the earlier updates).
 
-1. Download and extract `miaui-v1.0.3-perf-collections.zip`. It contains an `Updater.pak` folder.
+1. Download and extract `miaui-v1.0.3-perf-audio.zip`. It contains an `Updater.pak` folder.
 2. Copy the `Updater.pak` folder into the `Tools` folder of the card (ROMS partition, `/userdata/Tools`).
    - MiaUI's ROMS partition is ext4. On Windows, use a tool that can write ext4,
      or copy it over ADB (MiaUI's ADB app, in Tools):
@@ -69,6 +69,13 @@ The cause was in the frontend (minarch), not in the emulator. Fixes:
   math only) and the audio input rate follows it, instead of a rate fixed in the code.
 - **PCSX ReARMed updated (r23 from 2023 → r26 from 2026).**
   Adds threaded GPU rendering and the recent dynarec improvements.
+- **PCSX ReARMed no longer corrupts the frontend's floating point registers.**
+  Three of its NEON routines (the SPU channel mixers `mix_chan`/`mix_chan_rvb` and the GTE
+  `gteRTPT_sf1lm0_neon`) wrote d8-d15, which the ARM calling convention says a function
+  must give back unchanged, so any `double` minarch held across a frame came back as garbage
+  (nan). They now use d16-d31 instead: same instructions, no speed cost. Checked on the
+  device by filling d8-d15 with a known pattern around every frame (Bloody Roar): before,
+  556 of 2700 frames came back changed; after, 0 of 6000.
 
 Measured result (Tekken 3, Lenient): a steady 60.4 FPS, the screen's own rate, with ~4.7 ms
 to spare per frame. Before: ~30 FPS. The other systems should benefit from the minarch fixes
@@ -101,5 +108,5 @@ PERF mode=1 fps_x10=604 game=61 slow=0 worst_ms=16 vsync_on=61 | avg_us emu=1052
 `mode` is Prevent Tearing (0 Off, 1 Lenient, 2 Strict), `slow` counts frames over 17.5 ms,
 `emu` is the time between flips (emulation plus audio wait), `upload` the game texture,
 `ui` the UI layer, and `swap` eglSwapBuffers (which waits for vsync on this driver).
-The counters use integer math only: the PCSX NEON code leaves the VFP registers dirty,
-so doubles computed in minarch come out as nan/inf.
+The counters use integer math only: with an unpatched PCSX ReARMed, its NEON code clobbers
+d8-d15, so doubles held in minarch come out as nan/inf (fixed in this update's core, see above).

@@ -69,7 +69,7 @@ printf '#!/bin/sh\n\ncd "$(dirname "$0")"\n\npython ./local_updater.py\n' > /sta
 chmod 755 /stage/zip/Updater.pak/launch.sh /stage/zip/Updater.pak/local_updater.py
 mv /stage/update.tar.gz /stage/zip/Updater.pak/update_$CRC.tar.gz
 cd /stage/zip
-rm -f /out/miaui-v1.0.3-perf-collections.zip
-zip -q -r -X /out/miaui-v1.0.3-perf-collections.zip Updater.pak
+rm -f /out/miaui-v1.0.3-perf-audio.zip
+zip -q -r -X /out/miaui-v1.0.3-perf-audio.zip Updater.pak
 echo "update_$CRC.tar.gz:"
 tar tvzf Updater.pak/update_$CRC.tar.gz
