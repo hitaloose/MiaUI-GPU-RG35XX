@@ -13,6 +13,12 @@ X(STR_SLEEP, "SLEEP")
 X(STR_INFO, "INFO")
 X(STR_EMPTY_FOLDER, "Empty folder")
 
+// minui: collections (Y on a game or a port)
+X(STR_LISTS, "LISTS")
+X(STR_ADD, "ADD")
+X(STR_REMOVE, "REMOVE")
+X(STR_NO_COLLECTIONS, "No collections yet:\ncreate them in Tools > Collections")
+
 // Quick Menu (MENU on the main menu)
 X(STR_QM_SETTINGS, "Settings")
 X(STR_QM_ACHIEVEMENTS, "Achievements")
