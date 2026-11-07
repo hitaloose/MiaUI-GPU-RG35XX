@@ -1,6 +1,8 @@
+diff --git a/Makefile.libretro b/Makefile.libretro
+index cd53109e..5ee10652 100644
 --- a/Makefile.libretro
 +++ b/Makefile.libretro
-@@ -596,6 +596,25 @@
+@@ -596,6 +596,25 @@ else ifeq ($(platform), miyoo)
  	BUILTIN_GPU = unai
  	DYNAREC = ari64
  
@@ -26,3 +28,124 @@
  # Emscripten
  else ifeq ($(platform), emscripten)
     TARGET  := $(TARGET_NAME)_libretro_$(platform).bc
+diff --git a/libpcsxcore/gte_neon.S b/libpcsxcore/gte_neon.S
+index 6bc24792..72ed1c77 100644
+--- a/libpcsxcore/gte_neon.S
++++ b/libpcsxcore/gte_neon.S
+@@ -263,17 +263,17 @@ FUNCTION(gteRTPT_sf1lm0_neon): @ r0=CP2 (d,c),
+                                usat    r4, #16, r1    @ SZ1
+     vmovl.s16   q3, d4         @ expand gteIR|12 v0 v1
+                                ssat    r7, #16, r1    @ ir3 v0
+-    vmovl.s16   q4, d5         @ expand gteIR|12 v2
++    vmovl.s16   q12, d5        @ expand gteIR|12 v2 (q12/q13/d28, not the callee-saved q4-q6)
+     add         r12, r0, #4*12
+     vst1.32     d4, [r12, :64] @ save gteIR|12 v0 v1 to SXY0, arm will fix it later
+-    vceq.i32    q5, q0, q3
+-    vceq.i32    d12, d2, d8
++    vceq.i32    q13, q0, q3
++    vceq.i32    d28, d2, d24
+     add         r12, r0, #4*9
+-    vst1.32     d8, [r12]      @ save gteIR|12 v2
+-    vand        d10, d11
+-    vand        d10, d12
+-    vmvn        d10, d10       @ ~0 if gteIR|12 != gteMAC|12
+-    vst1.32     d10, [sp]
++    vst1.32     d24, [r12]     @ save gteIR|12 v2
++    vand        d26, d27
++    vand        d26, d28
++    vmvn        d26, d26       @ ~0 if gteIR|12 != gteMAC|12
++    vst1.32     d26, [sp]
+ 
+     ssat        r8, #16, r2          @ ir3 v1
+     ssat        r10,#16, r3          @ ir3 v2
+diff --git a/plugins/dfsound/arm_utils.S b/plugins/dfsound/arm_utils.S
+index 6d4ca88b..175d47ac 100644
+--- a/plugins/dfsound/arm_utils.S
++++ b/plugins/dfsound/arm_utils.S
+@@ -35,20 +35,22 @@ ptr_ChanBuf:   .word ESYM(ChanBuf)
+ 
+ #ifdef __ARM_NEON__
+ 
++@ Only d0-d7 and d16-d31 are used: d8-d15 are callee-saved (AAPCS), and
++@ clobbering them corrupted the frontend's floating point values.
+ FUNCTION(mix_chan): @ (int *SSumLR, int count, int lv, int rv)
+-    vmov.32     d14[0], r2
+-    vmov.32     d14[1], r3             @ multipliers
++    vmov.32     d20[0], r2
++    vmov.32     d20[1], r3             @ multipliers
+     mov         r2, r0
+     load_varadr r0, ChanBuf
+ 0:
+     vldmia      r0!, {d0-d1}
+     vldmia      r2, {d2-d5}
+-    vmul.s32    d10, d14, d0[0]
+-    vmul.s32    d11, d14, d0[1]
+-    vmul.s32    d12, d14, d1[0]
+-    vmul.s32    d13, d14, d1[1]
+-    vsra.s32    q1, q5, #14
+-    vsra.s32    q2, q6, #14
++    vmul.s32    d16, d20, d0[0]
++    vmul.s32    d17, d20, d0[1]
++    vmul.s32    d18, d20, d1[0]
++    vmul.s32    d19, d20, d1[1]
++    vsra.s32    q1, q8, #14
++    vsra.s32    q2, q9, #14
+     subs        r1, #4
+     blt         mc_finish
+     vstmia      r2!, {d2-d5}
+@@ -66,40 +68,40 @@ mc_finish:
+ 
+ 
+ FUNCTION(mix_chan_rvb): @ (int *SSumLR, int count, int lv, int rv, int *rvb)
+-    vmov.32     d14[0], r2
+-    vmov.32     d14[1], r3             @ multipliers
++    vmov.32     d20[0], r2
++    vmov.32     d20[1], r3             @ multipliers
+     mov         r2, r0
+     load_varadr r0, ChanBuf
+     ldr         r3, [sp]               @ rvb
+ 0:
+     vldmia      r0!, {d0-d1}
+     vldmia      r2, {d2-d5}
+-    vldmia      r3, {d6-d9}
+-    vmul.s32    d10, d14, d0[0]
+-    vmul.s32    d11, d14, d0[1]
+-    vmul.s32    d12, d14, d1[0]
+-    vmul.s32    d13, d14, d1[1]
+-    vsra.s32    q1, q5, #14
+-    vsra.s32    q2, q6, #14
+-    vsra.s32    q3, q5, #14
+-    vsra.s32    q4, q6, #14
++    vldmia      r3, {d24-d27}
++    vmul.s32    d16, d20, d0[0]
++    vmul.s32    d17, d20, d0[1]
++    vmul.s32    d18, d20, d1[0]
++    vmul.s32    d19, d20, d1[1]
++    vsra.s32    q1, q8, #14
++    vsra.s32    q2, q9, #14
++    vsra.s32    q12, q8, #14
++    vsra.s32    q13, q9, #14
+     subs        r1, #4
+     blt         mcr_finish
+     vstmia      r2!, {d2-d5}
+-    vstmia      r3!, {d6-d9}
++    vstmia      r3!, {d24-d27}
+     bgt         0b
+     nop
+     bxeq        lr
+ 
+ mcr_finish:
+     vstmia      r2!, {d2}
+-    vstmia      r3!, {d6}
++    vstmia      r3!, {d24}
+     cmp         r1, #-2
+     vstmiage    r2!, {d3}
+-    vstmiage    r3!, {d7}
++    vstmiage    r3!, {d25}
+     cmp         r1, #-1
+     vstmiage    r2!, {d4}
+-    vstmiage    r3!, {d8}
++    vstmiage    r3!, {d26}
+     bx          lr
+ 
+ #elif defined(HAVE_ARMV5)
