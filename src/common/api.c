@@ -12,13 +12,16 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 
 #include <msettings.h>
 
 #include "defines.h"
 #include "api.h"
+#include "nekobit_store.h"
 #include "utils.h"
+#include "profile.h"
 
 // -------------------------------------------------------------------------
 // Logging
@@ -55,15 +58,9 @@ void LOG_note(int level, const char* fmt, ...) {
 // GFX - High Level Graphics
 // -------------------------------------------------------------------------
 
-uint32_t RGB_WHITE;
-uint32_t RGB_BLACK;
-uint32_t RGB_LIGHT_GRAY;
-uint32_t RGB_GRAY;
-uint32_t RGB_DARK_GRAY;
-
 static struct GFX_Context {
     SDL_Surface* screen;
-    SDL_Surface* assets;
+    GFX_Image assets; // the sprite sheet
 
     int mode;
     int vsync;
@@ -100,8 +97,31 @@ static SDL_Rect asset_rects[] = {
     [ASSET_SWAP]             = (SDL_Rect){SCALE4(95,51,10,10)},
     [ASSET_SWAP_GRAY]        = (SDL_Rect){SCALE4(105,51,10,10)},
     [ASSET_SWAP_DARK_GRAY]   = (SDL_Rect){SCALE4(114,51,10,10)},
+    [ASSET_TROPHY]           = (SDL_Rect){SCALE4(114,39,10,10)},
+
+    [ASSET_WIFI_SMALL]       = (SDL_Rect){SCALE4( 8,65,11, 8)},
+    [ASSET_GEAR]             = (SDL_Rect){SCALE4(22,64,10,10)},
+    [ASSET_USB]              = (SDL_Rect){SCALE4(36,65, 5, 8)},
+    [ASSET_CLOCK]            = (SDL_Rect){SCALE4(44,64,10,10)},
+    [ASSET_GAMEPAD]          = (SDL_Rect){SCALE4(57,65,10, 8)},
+    [ASSET_SDCARD]           = (SDL_Rect){SCALE4(95,51, 8,10)}, // ASSET_SWAP's card, without its neighbour's edge
 };
-static uint32_t asset_rgbs[ASSET_COLORS];
+// the flat colour of each asset that is stretched with a fill
+static const SDL_Color asset_colors[ASSET_COLORS] = {
+    [ASSET_WHITE_PILL]      = {TRIAD_WHITE},
+    [ASSET_BLACK_PILL]      = {TRIAD_BLACK},
+    [ASSET_DARK_GRAY_PILL]  = {TRIAD_DARK_GRAY},
+    [ASSET_OPTION]          = {TRIAD_DARK_GRAY},
+    [ASSET_BUTTON]          = {TRIAD_WHITE},
+    [ASSET_PAGE_BG]         = {TRIAD_WHITE},
+    [ASSET_STATE_BG]        = {TRIAD_WHITE},
+    [ASSET_PAGE]            = {TRIAD_BLACK},
+    [ASSET_BAR]             = {TRIAD_WHITE},
+    [ASSET_BAR_BG]          = {TRIAD_BLACK},
+    [ASSET_BAR_BG_MENU]     = {TRIAD_DARK_GRAY},
+    [ASSET_UNDERLINE]       = {TRIAD_GRAY},
+    [ASSET_DOT]             = {TRIAD_LIGHT_GRAY},
+};
 GFX_Fonts font;
 
 static struct PWR_Context {
@@ -127,36 +147,21 @@ static int _;
  */
 SDL_Surface* GFX_init(int mode) {
     gfx.screen = PLAT_initVideo();
+    if (!gfx.screen) {
+        LOG_error("GFX_init: no video\n");
+        exit(1);
+    }
     PLAT_initInput();
 
     gfx.vsync = VSYNC_STRICT;
     gfx.mode = mode;
     
-    // Map standard colors to the screen format
-    RGB_WHITE        = SDL_MapRGB(gfx.screen->format, TRIAD_WHITE);
-    RGB_BLACK        = SDL_MapRGB(gfx.screen->format, TRIAD_BLACK);
-    RGB_LIGHT_GRAY    = SDL_MapRGB(gfx.screen->format, TRIAD_LIGHT_GRAY);
-    RGB_GRAY        = SDL_MapRGB(gfx.screen->format, TRIAD_GRAY);
-    RGB_DARK_GRAY    = SDL_MapRGB(gfx.screen->format, TRIAD_DARK_GRAY);
-    
-    asset_rgbs[ASSET_WHITE_PILL]    = RGB_WHITE;
-    asset_rgbs[ASSET_BLACK_PILL]    = RGB_BLACK;
-    asset_rgbs[ASSET_DARK_GRAY_PILL]= RGB_DARK_GRAY;
-    asset_rgbs[ASSET_OPTION]        = RGB_DARK_GRAY;
-    asset_rgbs[ASSET_BUTTON]        = RGB_WHITE;
-    asset_rgbs[ASSET_PAGE_BG]        = RGB_WHITE;
-    asset_rgbs[ASSET_STATE_BG]        = RGB_WHITE;
-    asset_rgbs[ASSET_PAGE]            = RGB_BLACK;
-    asset_rgbs[ASSET_BAR]            = RGB_WHITE;
-    asset_rgbs[ASSET_BAR_BG]        = RGB_BLACK;
-    asset_rgbs[ASSET_BAR_BG_MENU]    = RGB_DARK_GRAY;
-    asset_rgbs[ASSET_UNDERLINE]        = RGB_GRAY;
-    asset_rgbs[ASSET_DOT]            = RGB_LIGHT_GRAY;
-    
     // Load UI assets spritesheet
     char asset_path[MAX_PATH];
     sprintf(asset_path, RES_PATH "/assets@%ix.png", FIXED_SCALE);
-    gfx.assets = IMG_Load(asset_path);
+    SDL_Surface* assets = IMG_Load(asset_path);
+    gfx.assets = GFX_loadImage(assets);
+    SDL_FreeSurface(assets);
     
     // Initialize Fonts
     TTF_Init();
@@ -171,16 +176,18 @@ SDL_Surface* GFX_init(int mode) {
 /**
  * Shuts down the graphics subsystem and releases resources.
  */
+static void GFX_freeTextCache(void);
 void GFX_quit(void) {
+    GFX_freeTextCache();
+    GFX_freeImage(&gfx.assets);
+
     TTF_CloseFont(font.large);
     TTF_CloseFont(font.medium);
     TTF_CloseFont(font.small);
     TTF_CloseFont(font.tiny);
-    
-    SDL_FreeSurface(gfx.assets);
-        
-    GFX_clearAll();
 
+    // not GFX_clearAll(): the fade out in PLAT_quitVideo redraws what is on
+    // screen, the ui layer included
     PLAT_quitInput();
     PLAT_quitVideo();
 }
@@ -211,81 +218,219 @@ void GFX_startFrame(void) {
     frame_start = SDL_GetTicks();
 }
 
+// The panel's real refresh, learned from swaps that waited for vsync. SDL says
+// 60Hz; this RG35XX measures 60.46Hz, and it's the gap between that and a
+// core's own rate (59.73 for GB, 60.10 for NES) that makes a frame repeat
+// every second or two when audio sets the pace.
+static double   refresh_us = 1000000.0 / 60.0;
+static uint64_t last_present_us = 0;
+static int      last_present_vsynced = 0;
+
+static uint64_t GFX_nowMicros(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000ull + t.tv_nsec / 1000;
+}
+
+double GFX_getRefreshRate(void) {
+    return 1000000.0 / refresh_us;
+}
+
 /**
  * Flips the video buffer.
  * Handles VSync logic if strict vsync is enabled.
  */
-static void SND_panelRate(uint32_t hz_x1000);
-
-// The panel refresh rate, measured while vsync is on. It is not exactly 60 Hz (60.46 Hz on
-// the RG35XX), a ~60 fps core under vsync runs at that rate, and the audio input rate
-// follows it (SND_panelRate) instead of a value fixed at build time.
-// Integer math only: cores like PCSX ReARMed leave the VFP registers dirty, so doubles
-// computed here while a game runs can come out as nan.
-#define PANEL_WINDOW 120        // vsync periods per measurement (~2 s)
-#define PANEL_MAX_GAP_US 100000 // longer between flips (loading, menu stall): restart the window
-static struct {
-    uint64_t last_us;   // previous vsync flip, 0 = none
-    uint64_t win_us;    // time and vsync periods in the current window
-    uint32_t win_periods;
-    uint32_t hz_x1000;  // smoothed estimate, 0 = not measured yet
-    uint32_t period_us; // vsync period used to count periods per flip
-} panel = {0, 0, 0, 0, 16667};
-
-static uint64_t panel_now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)(ts.tv_nsec / 1000);
-}
-static void panel_track(int vsynced) {
-    uint64_t now = panel_now_us();
-    if (!vsynced) { // a flip that did not wait breaks the cadence
-        panel.last_us = 0;
-        panel.win_us = panel.win_periods = 0;
-        return;
-    }
-    uint64_t gap = panel.last_us ? now - panel.last_us : 0;
-    panel.last_us = now;
-    // Count vsync periods, not flips: a frame that missed vsync took 2 periods. Counting
-    // flips, one miss per 2 s window reads a 60.46 Hz panel as 59.96 Hz.
-    uint32_t periods = (uint32_t)((gap + panel.period_us / 2) / panel.period_us);
-    if (gap == 0 || gap > PANEL_MAX_GAP_US || periods == 0) {
-        panel.win_us = panel.win_periods = 0;
-        return;
-    }
-    panel.win_us += gap;
-    panel.win_periods += periods;
-    if (panel.win_periods < PANEL_WINDOW) return;
-
-    uint32_t hz = (uint32_t)((uint64_t)panel.win_periods * 1000000000u / panel.win_us);
-    panel.win_us = panel.win_periods = 0;
-    if (hz < 50000 || hz > 70000) return; // not a ~60 Hz cadence (swap not waiting)
-    panel.hz_x1000 = panel.hz_x1000 ? (panel.hz_x1000 * 3 + hz) / 4 : hz;
-    panel.period_us = 1000000000u / panel.hz_x1000;
-    SND_panelRate(panel.hz_x1000);
-}
-
+static uint32_t text_frame; // bumped every flip, for the text cache's LRU
 void GFX_flip(SDL_Surface* screen) {
-    int should_vsync = (gfx.vsync!=VSYNC_OFF && (gfx.vsync==VSYNC_STRICT || frame_start==0 || SDL_GetTicks()-frame_start<FRAME_BUDGET));
+    text_frame += 1;
+    uint64_t now = GFX_nowMicros();
+    int should_vsync = gfx.vsync!=VSYNC_OFF;
+
+    // Lenient: a frame that has already missed its refresh goes out now - one
+    // torn frame - rather than waiting a whole extra refresh, which is a 33ms
+    // stall. Only when vsync is the clock: when the audio ring sets the pace,
+    // frames are meant to be spaced by it, so "late" means nothing.
+    if (should_vsync && gfx.vsync==VSYNC_LENIENT && SND_isVideoClocked() && last_present_us) {
+        if (now - last_present_us > refresh_us) should_vsync = 0;
+    }
+
     PLAT_flip(screen, should_vsync);
-    panel_track(should_vsync);
-    if (gfx.vsync==VSYNC_OFF) SND_panelRate(0); // audio-paced: play at the core's own rate
+
+    // Two back-to-back swaps that each waited for vsync are one refresh apart.
+    // Anything else (a late frame, a pause, a torn swap) is left out.
+    uint64_t after = GFX_nowMicros();
+    if (should_vsync && last_present_vsynced && last_present_us) {
+        double dt = (double)(after - last_present_us);
+        if (dt > refresh_us * 0.9 && dt < refresh_us * 1.1) refresh_us += (dt - refresh_us) / 32.0;
+    }
+    last_present_us = after;
+    last_present_vsynced = should_vsync;
+    PROF_GAUGE(PROF_G_REFRESH_MHZ, (int64_t)(1e9 / refresh_us));
+    PROF_FP(PROF_FP_REFRESH, GFX_getRefreshRate());
 }
 
 /**
- * Manual synchronization to maintain 60fps if GFX_flip wasn't called.
+ * For a loop iteration that had nothing to draw: sleeps until there is
+ * input, or for what is left of the frame (timers: key repeat, sleep, the
+ * settings pill). Vsync only ever happens inside a flip here, so without
+ * this a menu waiting for input spun at ~38k iterations a second, 100% of a
+ * core. Only menus call it, never the game loop.
  */
 void GFX_sync(void) {
-    uint32_t frame_duration = SDL_GetTicks() - frame_start;
-    if (gfx.vsync!=VSYNC_OFF) {
-        // this limiting condition helps SuperFX chip games
-        if (gfx.vsync==VSYNC_STRICT || frame_start==0 || frame_duration<FRAME_BUDGET) { // only wait if we're under frame budget
-            PLAT_vsync(FRAME_BUDGET-frame_duration);
+    // a frame that is already over (or a loop that never called
+    // GFX_startFrame) waits a whole one: input still ends the wait at once
+    int remaining = FRAME_BUDGET - (int)(SDL_GetTicks() - frame_start);
+    if (remaining<1 || remaining>FRAME_BUDGET) remaining = FRAME_BUDGET;
+    SDL_WaitEventTimeout(NULL, remaining);
+}
+
+// -------------------------------------------------------------------------
+// Text
+// -------------------------------------------------------------------------
+//
+// A string is rendered once, in white, into an 8-bit alpha texture and drawn
+// tinted from then on. A list redraw is the same few dozen strings again and
+// again (rows, button hints, the battery pill), so after the first frame
+// almost nothing is rendered at all.
+
+#define TEXT_CACHE_MAX   192
+#define TEXT_CACHE_BYTES (3 * 1024 * 1024) // alpha texels; a list row is ~23KB
+
+typedef struct {
+    TTF_Font* font;
+    char* str;
+    uint32_t hash;
+    unsigned tex;
+    int w, h;
+    uint32_t used; // text_frame when last asked for
+} TextEntry;
+
+static struct {
+    TextEntry entries[TEXT_CACHE_MAX];
+    int count;
+    size_t bytes;
+    TextEntry spare; // the latest string that didn't fit, never looked up
+} text_cache;
+
+static uint32_t GFX_textHash(TTF_Font* font, const char* str) {
+    uint32_t h = 2166136261u ^ (uint32_t)(uintptr_t)font; // FNV-1a
+    for (const unsigned char* c = (const unsigned char*)str; *c; c++) h = (h ^ *c) * 16777619u;
+    return h;
+}
+
+static void GFX_evictText(int i) {
+    TextEntry* e = &text_cache.entries[i];
+    PLAT_uiFreeTexture(e->tex);
+    free(e->str);
+    text_cache.bytes -= (size_t)e->w * e->h;
+    *e = text_cache.entries[--text_cache.count];
+}
+
+static void GFX_freeTextCache(void) {
+    while (text_cache.count) GFX_evictText(text_cache.count - 1);
+    PLAT_uiFreeTexture(text_cache.spare.tex);
+    text_cache.spare.tex = 0;
+}
+
+static TextEntry* GFX_cachedText(TTF_Font* font, const char* str) {
+    uint32_t hash = GFX_textHash(font, str);
+    for (int i=0; i<text_cache.count; i++) {
+        TextEntry* e = &text_cache.entries[i];
+        if (e->hash==hash && e->font==font && !strcmp(e->str, str)) {
+            e->used = text_frame;
+            return e;
         }
     }
-    else {
-        if (frame_duration<FRAME_BUDGET) SDL_Delay(FRAME_BUDGET-frame_duration);
+
+    SDL_Surface* text = TTF_RenderUTF8_Blended(font, str, (SDL_Color){0xff,0xff,0xff,0xff});
+    if (!text) return NULL; // e.g. an empty string
+    int w = text->w;
+    int h = text->h;
+    uint8_t* alpha = malloc((size_t)w * h);
+    if (!alpha) {
+        SDL_FreeSurface(text);
+        return NULL;
     }
+    int shift = text->format->Ashift;
+    for (int y=0; y<h; y++) {
+        const uint32_t* src = (const uint32_t*)((const uint8_t*)text->pixels + y * text->pitch);
+        uint8_t* dst = alpha + y * w;
+        for (int x=0; x<w; x++) dst[x] = src[x] >> shift;
+    }
+    unsigned tex = PLAT_uiAlphaTexture(alpha, w, h);
+    free(alpha);
+    SDL_FreeSurface(text);
+    if (!tex) return NULL;
+
+    // make room: least recently used first. One screen needs a few dozen
+    // strings, so whatever goes was not drawn in this frame. What was asked
+    // for in this frame stays, even past the budget: a GFX_Text the caller
+    // still holds must not lose its texture.
+    size_t bytes = (size_t)w * h;
+    while (text_cache.count && (text_cache.count>=TEXT_CACHE_MAX || text_cache.bytes+bytes>TEXT_CACHE_BYTES)) {
+        int lru = 0;
+        for (int i=1; i<text_cache.count; i++) {
+            if (text_cache.entries[i].used < text_cache.entries[lru].used) lru = i;
+        }
+        if (text_cache.entries[lru].used==text_frame) break;
+        GFX_evictText(lru);
+    }
+    if (text_cache.count>=TEXT_CACHE_MAX) { // all from this frame: draw it, don't keep it
+        PLAT_uiFreeTexture(text_cache.spare.tex);
+        text_cache.spare = (TextEntry){ .font=font, .hash=hash, .tex=tex, .w=w, .h=h, .used=text_frame };
+        return &text_cache.spare;
+    }
+
+    TextEntry* e = &text_cache.entries[text_cache.count++];
+    e->font = font;
+    e->str = strdup(str);
+    e->hash = hash;
+    e->tex = tex;
+    e->w = w;
+    e->h = h;
+    e->used = text_frame;
+    text_cache.bytes += bytes;
+    return e;
+}
+
+GFX_Text GFX_renderText(TTF_Font* font, const char* str, SDL_Color color) {
+    GFX_Text text = {0};
+    text.color = color;
+    TextEntry* e = (font && str && *str) ? GFX_cachedText(font, str) : NULL;
+    if (e) {
+        text.tex = e->tex;
+        text.w = e->w;
+        text.h = e->h;
+    }
+    return text;
+}
+void GFX_blitRenderedText(GFX_Text* text, SDL_Rect* src_rect, SDL_Surface* dst, int x, int y) {
+    PLAT_uiDraw(dst, text->tex, text->w, text->h, 1, src_rect, &(SDL_Rect){x,y}, text->color, 255);
+}
+
+// -------------------------------------------------------------------------
+// Images and fills
+// -------------------------------------------------------------------------
+
+GFX_Image GFX_loadImage(SDL_Surface* surface) {
+    GFX_Image image = {0};
+    if (!surface) return image;
+    image.tex = PLAT_uiTexture(surface);
+    if (image.tex) {
+        image.w = surface->w;
+        image.h = surface->h;
+    }
+    return image;
+}
+void GFX_freeImage(GFX_Image* image) {
+    PLAT_uiFreeTexture(image->tex);
+    *image = (GFX_Image){0};
+}
+void GFX_blitImage(GFX_Image* image, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    PLAT_uiDraw(dst, image->tex, image->w, image->h, 0, src_rect, dst_rect, COLOR_WHITE, 255);
+}
+void GFX_fillRect(SDL_Surface* dst, SDL_Rect* rect, SDL_Color color, int opacity) {
+    PLAT_uiFill(dst, rect, color, opacity);
 }
 
 int GFX_truncateText(TTF_Font* font, const char* in_name, char* out_name, int max_width, int padding) {
@@ -364,184 +509,10 @@ int GFX_wrapText(TTF_Font* font, char* str, int max_width, int max_lines) {
 }
 
 // -------------------------------------------------------------------------
-// Anti-Aliased Scaling Logic (Software)
-// -------------------------------------------------------------------------
-
-// scale_blend (and supporting logic) from picoarch
-
-struct blend_args {
-    int w_ratio_in;
-    int w_ratio_out;
-    uint16_t w_bp[2];
-    int h_ratio_in;
-    int h_ratio_out;
-    uint16_t h_bp[2];
-    uint16_t *blend_line;
-} blend_args;
-
-#if __ARM_ARCH >= 5
-static inline uint32_t average16(uint32_t c1, uint32_t c2) {
-    uint32_t ret, lowbits = 0x0821;
-    asm ("eor %0, %2, %3\r\n"
-         "and %0, %0, %1\r\n"
-         "add %0, %3, %0\r\n"
-         "add %0, %0, %2\r\n"
-         "lsr %0, %0, #1\r\n"
-         : "=&r" (ret) : "r" (lowbits), "r" (c1), "r" (c2) : );
-    return ret;
-}
-static inline uint32_t average32(uint32_t c1, uint32_t c2) {
-    uint32_t ret, lowbits = 0x08210821;
-
-    asm ("eor %0, %3, %1\r\n"
-         "and %0, %0, %2\r\n"
-         "adds %0, %1, %0\r\n"
-         "and %1, %1, #0\r\n"
-         "movcs %1, #0x80000000\r\n"
-         "adds %0, %0, %3\r\n"
-         "rrx %0, %0\r\n"
-         "orr %0, %0, %1\r\n"
-         : "=&r" (ret), "+r" (c2) : "r" (lowbits), "r" (c1) : "cc" );
-
-    return ret;
-}
-
-#define AVERAGE16_NOCHK(c1, c2) (average16((c1), (c2)))
-#define AVERAGE32_NOCHK(c1, c2) (average32((c1), (c2)))
-
-#else
-
-static inline uint32_t average16(uint32_t c1, uint32_t c2) {
-    return (c1 + c2 + ((c1 ^ c2) & 0x0821))>>1;
-}
-static inline uint32_t average32(uint32_t c1, uint32_t c2) {
-    uint32_t sum = c1 + c2;
-    uint32_t ret = sum + ((c1 ^ c2) & 0x08210821);
-    uint32_t of = ((sum < c1) | (ret < sum)) << 31;
-
-    return (ret >> 1) | of;
-}
-
-#define AVERAGE16_NOCHK(c1, c2) (average16((c1), (c2)))
-#define AVERAGE32_NOCHK(c1, c2) (average32((c1), (c2)))
-
-#endif
-
-#define AVERAGE16(c1, c2) ((c1) == (c2) ? (c1) : AVERAGE16_NOCHK((c1), (c2)))
-#define AVERAGE16_1_3(c1, c2) ((c1) == (c2) ? (c1) : (AVERAGE16_NOCHK(AVERAGE16_NOCHK((c1), (c2)), (c2))))
-
-#define AVERAGE32(c1, c2) ((c1) == (c2) ? (c1) : AVERAGE32_NOCHK((c1), (c2)))
-#define AVERAGE32_1_3(c1, c2) ((c1) == (c2) ? (c1) : (AVERAGE32_NOCHK(AVERAGE32_NOCHK((c1), (c2)), (c2))))
-
-static inline int gcd(int a, int b) {
-    return b ? gcd(b, a % b) : a;
-}
-
-/**
- * Performs anti-aliased scaling of an image.
- * Uses a weighted average approach to blend pixels when downscaling or upscaling.
- */
-static void scaleAA(void* __restrict src, void* __restrict dst, uint32_t w, uint32_t h, uint32_t pitch, uint32_t dst_w, uint32_t dst_h, uint32_t dst_p) {
-    int dy = 0;
-    int lines = h;
-
-    int rat_w = blend_args.w_ratio_in;
-    int rat_dst_w = blend_args.w_ratio_out;
-    uint16_t *bw = blend_args.w_bp;
-
-    int rat_h = blend_args.h_ratio_in;
-    int rat_dst_h = blend_args.h_ratio_out;
-    uint16_t *bh = blend_args.h_bp;
-
-    while (lines--) {
-        while (dy < rat_dst_h) {
-            uint16_t *dst16 = (uint16_t *)dst;
-            uint16_t *pblend = (uint16_t *)blend_args.blend_line;
-            int col = w;
-            int dx = 0;
-
-            uint16_t *pnext = (uint16_t *)(src + pitch);
-            if (!lines)
-                pnext -= (pitch / sizeof(uint16_t));
-
-            // Vertical Blending Logic
-            if (dy > rat_dst_h - bh[0]) {
-                pblend = pnext;
-            } else if (dy <= bh[0]) {
-                /* Drops const, won't get touched later though */
-                pblend = (uint16_t *)src;
-            } else {
-                const uint32_t *src32 = (const uint32_t *)src;
-                const uint32_t *pnext32 = (const uint32_t *)pnext;
-                uint32_t *pblend32 = (uint32_t *)pblend;
-                int count = w / 2;
-
-                if (dy <= bh[1]) {
-                    const uint32_t *tmp = pnext32;
-                    pnext32 = src32;
-                    src32 = tmp;
-                }
-
-                if (dy > rat_dst_h - bh[1] || dy <= bh[1]) {
-                    while(count--) {
-                        *pblend32++ = AVERAGE32_1_3(*src32, *pnext32);
-                        src32++;
-                        pnext32++;
-                    }
-                } else {
-                    while(count--) {
-                        *pblend32++ = AVERAGE32(*src32, *pnext32);
-                        src32++;
-                        pnext32++;
-                    }
-                }
-            }
-
-            // Horizontal Blending Logic
-            while (col--) {
-                uint16_t a, b, out;
-
-                a = *pblend;
-                b = *(pblend+1);
-
-                while (dx < rat_dst_w) {
-                    if (a == b) {
-                        out = a;
-                    } else if (dx > rat_dst_w - bw[0]) { // top quintile, bbbb
-                        out = b;
-                    } else if (dx <= bw[0]) { // last quintile, aaaa
-                        out = a;
-                    } else {
-                        if (dx > rat_dst_w - bw[1]) { // 2nd quintile, abbb
-                            a = AVERAGE16_NOCHK(a,b);
-                        } else if (dx <= bw[1]) { // 4th quintile, aaab
-                            b = AVERAGE16_NOCHK(a,b);
-                        }
-
-                        out = AVERAGE16_NOCHK(a, b); // also 3rd quintile, aabb
-                    }
-                    *dst16++ = out;
-                    dx += rat_w;
-                }
-
-                dx -= rat_dst_w;
-                pblend++;
-            }
-
-            dy += rat_h;
-            dst += dst_p;
-        }
-
-        dy -= rat_dst_h;
-        src += pitch;
-    }
-}
-
-// -------------------------------------------------------------------------
 // UI Assets Blitting
 // -------------------------------------------------------------------------
 
-void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+static void GFX_blitAssetTint(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color tint, int opacity) {
     SDL_Rect* rect = &asset_rects[asset];
     SDL_Rect adj_rect = {
         .x = rect->x,
@@ -555,9 +526,35 @@ void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* ds
         adj_rect.w  = src_rect->w;
         adj_rect.h  = src_rect->h;
     }
-    SDL_BlitSurface(gfx.assets, &adj_rect, dst, dst_rect);
+    // 1:1, like SDL_BlitSurface: only the position of dst_rect counts
+    SDL_Rect at = { dst_rect ? dst_rect->x : 0, dst_rect ? dst_rect->y : 0 };
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &adj_rect, &at, tint, opacity);
 }
-void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
+static void GFX_blitAssetAlpha(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
+    GFX_blitAssetTint(asset, src_rect, dst, dst_rect, COLOR_WHITE, opacity);
+}
+void GFX_blitAssetColor(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    GFX_blitAssetTint(asset, src_rect, dst, dst_rect, color, 255);
+}
+void GFX_blitAssetScaled(int asset, SDL_Surface* dst, SDL_Rect* box, int scale, SDL_Color color) {
+    SDL_Rect* rect = &asset_rects[asset];
+    int w = rect->w * scale;
+    int h = rect->h * scale;
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, rect,
+                &(SDL_Rect){box->x + (box->w - w) / 2, box->y + (box->h - h) / 2, w, h}, color, 255);
+}
+void GFX_blitAssetSized(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &asset_rects[asset], dst_rect, color, 255);
+}
+void GFX_blitAsset(int asset, SDL_Rect* src_rect, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    GFX_blitAssetAlpha(asset, src_rect, dst, dst_rect, 255);
+}
+static void GFX_fillAsset(int asset, SDL_Surface* dst, SDL_Rect rect, int opacity) {
+    PLAT_uiFill(dst, &rect, asset_colors[asset], opacity);
+}
+// The caps and the fill don't overlap, so a translucent pill is just its
+// pieces drawn translucent.
+void GFX_blitPillAlpha(int asset, SDL_Surface* dst, SDL_Rect* dst_rect, int opacity) {
     int x = dst_rect->x;
     int y = dst_rect->y;
     int w = dst_rect->w;
@@ -569,31 +566,72 @@ void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     if (w < h) w = h;
     w -= h;
     
-    GFX_blitAsset(asset, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y});
+    GFX_blitAssetAlpha(asset, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y}, opacity);
     x += r;
     if (w>0) {
-        SDL_FillRect(dst, &(SDL_Rect){x,y,w,h}, asset_rgbs[asset]);
+        GFX_fillAsset(asset, dst, (SDL_Rect){x,y,w,h}, opacity);
         x += w;
     }
-    GFX_blitAsset(asset, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y});
+    GFX_blitAssetAlpha(asset, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y}, opacity);
+}
+void GFX_blitPill(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
+    GFX_blitPillAlpha(asset, dst, dst_rect, 255);
+}
+// a pill in any colour: the white one's caps tinted, and a fill between
+void GFX_blitPillColor(SDL_Surface* dst, SDL_Rect* dst_rect, SDL_Color color) {
+    int x = dst_rect->x;
+    int y = dst_rect->y;
+    int w = dst_rect->w;
+    int h = dst_rect->h;
+    if (h==0) h = asset_rects[ASSET_WHITE_PILL].h;
+
+    int r = h / 2;
+    if (w < h) w = h;
+    w -= h;
+
+    GFX_blitAssetTint(ASSET_WHITE_PILL, &(SDL_Rect){0,0,r,h}, dst, &(SDL_Rect){x,y}, color, 255);
+    x += r;
+    if (w>0) {
+        PLAT_uiFill(dst, &(SDL_Rect){x,y,w,h}, color, 255);
+        x += w;
+    }
+    GFX_blitAssetTint(ASSET_WHITE_PILL, &(SDL_Rect){r,0,r,h}, dst, &(SDL_Rect){x,y}, color, 255);
+}
+// A pill of any height h: the caps are the smallest white disc at least that
+// tall (ASSET_BUTTON or ASSET_WHITE_PILL), scaled to h when it isn't exact
+static void GFX_blitCapsule(SDL_Surface* dst, int x, int y, int w, int h, SDL_Color color) {
+    SDL_Rect* disc = &asset_rects[h <= asset_rects[ASSET_BUTTON].h ? ASSET_BUTTON : ASSET_WHITE_PILL];
+    int half = disc->w / 2;
+    int r = h / 2, r2 = h - r;
+    if (w < h) w = h;
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &(SDL_Rect){disc->x, disc->y, half, disc->h},
+                &(SDL_Rect){x, y, r, h}, color, 255);
+    if (w > h) PLAT_uiFill(dst, &(SDL_Rect){x + r, y, w - h, h}, color, 255);
+    PLAT_uiDraw(dst, gfx.assets.tex, gfx.assets.w, gfx.assets.h, 0, &(SDL_Rect){disc->x + half, disc->y, disc->w - half, disc->h},
+                &(SDL_Rect){x + w - r2, y, r2, h}, color, 255);
+}
+// An outlined pill, like a key drawn as a frame: the ring is the line colour
+// showing around a pill of fill colour `border` pixels smaller on every side
+void GFX_blitPillOutline(SDL_Surface* dst, SDL_Rect* dst_rect, int border, SDL_Color line, SDL_Color fill) {
+    SDL_Rect* r = dst_rect;
+    GFX_blitCapsule(dst, r->x, r->y, r->w, r->h, line);
+    GFX_blitCapsule(dst, r->x + border, r->y + border, r->w - border * 2, r->h - border * 2, fill);
 }
 void GFX_blitRect(int asset, SDL_Surface* dst, SDL_Rect* dst_rect) {
     int x = dst_rect->x;
     int y = dst_rect->y;
     int w = dst_rect->w;
     int h = dst_rect->h;
-    int c = asset_rgbs[asset];
-    
     SDL_Rect* rect = &asset_rects[asset];
     int d = rect->w;
     int r = d / 2;
 
     GFX_blitAsset(asset, &(SDL_Rect){0,0,r,r}, dst, &(SDL_Rect){x,y});
-    SDL_FillRect(dst, &(SDL_Rect){x+r,y,w-d,r}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x+r,y,w-d,r}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){r,0,r,r}, dst, &(SDL_Rect){x+w-r,y});
-    SDL_FillRect(dst, &(SDL_Rect){x,y+r,w,h-d}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x,y+r,w,h-d}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){0,r,r,r}, dst, &(SDL_Rect){x,y+h-r});
-    SDL_FillRect(dst, &(SDL_Rect){x+r,y+h-r,w-d,r}, c);
+    GFX_fillAsset(asset, dst, (SDL_Rect){x+r,y+h-r,w-d,r}, 255);
     GFX_blitAsset(asset, &(SDL_Rect){r,r,r,r}, dst, &(SDL_Rect){x+w-r,y+h-r});
 }
 void GFX_blitBattery(SDL_Surface* dst, SDL_Rect* dst_rect) {
@@ -647,7 +685,7 @@ int GFX_getButtonWidth(char* hint, char* button) {
     return button_width;
 }
 void GFX_blitButton(char* hint, char*button, SDL_Surface* dst, SDL_Rect* dst_rect) {
-    SDL_Surface* text;
+    GFX_Text text;
     int ox = 0;
     
     int special_case = !strcmp(button,BRIGHTNESS_BUTTON_LABEL); // TODO: oof
@@ -657,36 +695,32 @@ void GFX_blitButton(char* hint, char*button, SDL_Surface* dst, SDL_Rect* dst_rec
         GFX_blitAsset(ASSET_BUTTON, NULL, dst, dst_rect);
 
         // label
-        text = TTF_RenderUTF8_Blended(font.medium, button, COLOR_BUTTON_TEXT);
-        SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){dst_rect->x+(SCALE1(BUTTON_SIZE)-text->w)/2,dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2});
+        text = GFX_renderText(font.medium, button, COLOR_BUTTON_TEXT);
+        GFX_blitRenderedText(&text, NULL, dst, dst_rect->x+(SCALE1(BUTTON_SIZE)-text.w)/2,dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
         ox += SCALE1(BUTTON_SIZE);
-        SDL_FreeSurface(text);
     }
     else {
-        text = TTF_RenderUTF8_Blended(special_case ? font.large : font.tiny, button, COLOR_BUTTON_TEXT);
-        GFX_blitPill(ASSET_BUTTON, dst, &(SDL_Rect){dst_rect->x,dst_rect->y,SCALE1(BUTTON_SIZE)/2+text->w,SCALE1(BUTTON_SIZE)});
+        text = GFX_renderText(special_case ? font.large : font.tiny, button, COLOR_BUTTON_TEXT);
+        GFX_blitPill(ASSET_BUTTON, dst, &(SDL_Rect){dst_rect->x,dst_rect->y,SCALE1(BUTTON_SIZE)/2+text.w,SCALE1(BUTTON_SIZE)});
         ox += SCALE1(BUTTON_SIZE)/4;
         
         int oy = special_case ? SCALE1(-2) : 0;
-        SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){ox+dst_rect->x,oy+dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2,text->w,text->h});
-        ox += text->w;
+        GFX_blitRenderedText(&text, NULL, dst, ox+dst_rect->x,oy+dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
+        ox += text.w;
         ox += SCALE1(BUTTON_SIZE)/4;
-        SDL_FreeSurface(text);
     }
     
     ox += SCALE1(BUTTON_MARGIN);
 
     // hint text
-    text = TTF_RenderUTF8_Blended(font.small, hint, COLOR_WHITE);
-    SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){ox+dst_rect->x,dst_rect->y+(SCALE1(BUTTON_SIZE)-text->h)/2,text->w,text->h});
-    SDL_FreeSurface(text);
+    text = GFX_renderText(font.small, hint, COLOR_WHITE);
+    GFX_blitRenderedText(&text, NULL, dst, ox+dst_rect->x,dst_rect->y+(SCALE1(BUTTON_SIZE)-text.h)/2);
 }
 void GFX_blitMessage(TTF_Font* font, char* msg, SDL_Surface* dst, SDL_Rect* dst_rect) {
     if (!dst_rect) dst_rect = &(SDL_Rect){0,0,dst->w,dst->h};
     
     // LOG_info("GFX_blitMessage: %p (%ix%i)", dst, dst_rect->w,dst_rect->h);
     
-    SDL_Surface* text;
 #define TEXT_BOX_MAX_ROWS 16
 #define LINE_HEIGHT 24
     char* rows[TEXT_BOX_MAX_ROWS];
@@ -718,11 +752,10 @@ void GFX_blitMessage(TTF_Font* font, char* msg, SDL_Surface* dst, SDL_Rect* dst_
         
         
         if (len) {
-            text = TTF_RenderUTF8_Blended(font, line, COLOR_WHITE);
+            GFX_Text text = GFX_renderText(font, line, COLOR_WHITE);
             int x = dst_rect->x;
-            x += (dst_rect->w - text->w) / 2;
-            SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){x,y});
-            SDL_FreeSurface(text);
+            x += (dst_rect->w - text.w) / 2;
+            GFX_blitRenderedText(&text, NULL, dst, x, y);
         }
         y += SCALE1(LINE_HEIGHT);
     }
@@ -788,12 +821,22 @@ int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting) {
         }
     }
     else {
-        // TODO: handle wifi
-        int show_wifi = PLAT_isOnline(); // NOOOOO! not every frame!
+        // what USB is up to, ahead of the battery: the plug for ADB, the
+        // plug and wifi for ADB + network
+        int usb = USB_getMode();
+        int icons[2];
+        int n = 0;
+        if (usb!=USB_MODE_NONE) icons[n++] = ASSET_USB;
+        if (USB_hasNetwork(usb)) icons[n++] = ASSET_WIFI_SMALL;
 
-        int ww = SCALE1(PILL_SIZE-3);
+        int lead = SCALE1(9); // pill edge to the first icon
+        int gap = SCALE1(6);  // after each icon
+        int battery_margin = SCALE1(5); // the battery's own space, left of it
         ow = SCALE1(PILL_SIZE);
-        if (show_wifi) ow += ww;
+        if (n) {
+            ow += lead - battery_margin;
+            for (int i=0; i<n; i++) ow += asset_rects[icons[i]].w + gap;
+        }
 
         ox = dst->w - SCALE1(PADDING) - ow;
         oy = SCALE1(PADDING);
@@ -803,17 +846,13 @@ int GFX_blitHardwareGroup(SDL_Surface* dst, int show_setting) {
             ow,
             SCALE1(PILL_SIZE)
         });
-        if (show_wifi) {
-            SDL_Rect rect = asset_rects[ASSET_WIFI];
-            int x = ox;
-            int y = oy;
-            x += (SCALE1(PILL_SIZE) - rect.w) / 2;
-            y += (SCALE1(PILL_SIZE) - rect.h) / 2;
-            
-            GFX_blitAsset(ASSET_WIFI, NULL, dst, &(SDL_Rect){x,y});
-            ox += ww;
+        int x = ox + lead;
+        for (int i=0; i<n; i++) {
+            SDL_Rect rect = asset_rects[icons[i]];
+            GFX_blitAsset(icons[i], NULL, dst, &(SDL_Rect){x, oy + (SCALE1(PILL_SIZE) - rect.h) / 2});
+            x += rect.w + gap;
         }
-        GFX_blitBattery(dst, &(SDL_Rect){ox,oy});
+        GFX_blitBattery(dst, &(SDL_Rect){ox + ow - SCALE1(PILL_SIZE),oy});
     }
     
     return ow;
@@ -930,7 +969,6 @@ void GFX_blitText(TTF_Font* font, char* str, int leading, SDL_Color color, SDL_S
     int x = dst_rect->x;
     int y = dst_rect->y;
     
-    SDL_Surface* text;
     char line[256];
     for (int i=0; i<count; i++) {
         int len;
@@ -945,9 +983,8 @@ void GFX_blitText(TTF_Font* font, char* str, int leading, SDL_Color color, SDL_S
         }
         
         if (len) {
-            text = TTF_RenderUTF8_Blended(font, line, color);
-            SDL_BlitSurface(text, NULL, dst, &(SDL_Rect){x+((dst_rect->w-text->w)/2),y+(i*leading)});
-            SDL_FreeSurface(text);
+            GFX_Text text = GFX_renderText(font, line, color);
+            GFX_blitRenderedText(&text, NULL, dst, x+((dst_rect->w-text.w)/2), y+(i*leading));
         }
     }
 }
@@ -968,8 +1005,6 @@ typedef int (*SND_Resampler)(const SND_Frame frame);
 static struct SND_Context {
     int initialized;
     double frame_rate;
-    int fps_x1000;        // the core's frame rate (integer copy, see panel_track)
-    int base_rate_in;     // the core's sample rate; sample_rate_in is it scaled to the panel
     
     int sample_rate_in;
     int sample_rate_out;
@@ -981,23 +1016,214 @@ static struct SND_Context {
     int frame_in;     // buf_w
     int frame_out;    // buf_r
     int frame_filled; // max_buf_w
-    
+
     SND_Resampler resample;
+
+    SND_Frame prev;     // last input frame: the left end of the interpolation
+    uint32_t phase;     // Q16: where the next output frame falls between prev and the incoming frame
+    uint32_t step;      // Q16: input frames advanced per output frame
+    int video_clocked;  // see SND_updateClock
+    int starved;        // set by the callback when it ran out; read under the audio lock
+    double target;      // ring fill the video clock steers toward, 0..1
+    double last_fill;   // fill at the previous batch, 0..1
 } snd = {0};
 
 /**
  * SDL Audio callback. Fills the stream with samples from the ring buffer.
  */
+///////////////////////////////////////
+// achievement chime
+//
+// A two-note chime synthesised on the fly from a quarter-kilobyte sine table.
+//
+// Why a table and not a baked PCM array: SDL negotiates the output rate in
+// SND_init, so a precomputed buffer would be pitch- and tempo-locked to
+// whatever rate it was generated at, and would need resampling to be correct.
+// A phase accumulator just takes the rate as a divisor and is right at any of
+// them. It is also 512 bytes of rodata instead of ~37KB.
+//
+// Cost per sample: one table index, two multiplies, three adds. Only while a
+// chime is sounding (~400ms, on an achievement unlock), and only a single
+// predictable branch otherwise.
+
+#define CHIME_LUT_BITS   8
+#define CHIME_LUT_SIZE   (1 << CHIME_LUT_BITS)
+#define CHIME_ATTACK_MS  8         // long enough not to click, short enough to be a chime
+#define CHIME_VOLUME     6         // volume shift (2^6 = 64): 64 out of 256
+#define CHIME_ENV_ONE    (1 << 24) // envelope accumulates in Q24...
+#define CHIME_ENV_SHIFT  9         // ...and is applied in Q15, so the multiply can't overflow
+
+// one cycle, full scale
+static const int16_t chime_sine[CHIME_LUT_SIZE] = {
+         0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+      6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+     12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+     18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+     23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+     27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+     30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+     32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+     32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+     32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+     30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+     27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+     23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+     18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+     12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+      6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+         0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+     -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+    -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+    -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+    -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+    -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+    -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+    -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+    -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+    -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+    -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+    -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+    -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+    -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+    -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+     -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804,
+};
+
+/*
+ * Musical frequency reference (A4 = 440 Hz)
+ * Rounded values for uint16_t hz:
+ *
+ * Octave 4 (Low / Mid):
+ * C4  : 262    C#4 : 277    D4  : 294    D#4 : 311
+ * E4  : 330    F4  : 349    F#4 : 370    G4  : 392
+ * G#4 : 415    A4  : 440    A#4 : 466    B4  : 494
+ *
+ * Octave 5 (Standard High):
+ * C5  : 523    C#5 : 554    D5  : 587    D#5 : 622
+ * E5  : 659    F5  : 698    F#5 : 740    G5  : 784
+ * G#5 : 831    A5  : 880    A#5 : 932    B5  : 988
+ *
+ * Octave 6 (Very High / Chimes):
+ * C6  : 1046   C#6 : 1109   D6  : 1175   D#6 : 1245
+ * E6  : 1319   F6  : 1397   F#6 : 1480   G6  : 1568
+ * G#6 : 1661   A6  : 1760   A#6 : 1865   B6  : 1976
+ *
+ */
+
+// static const struct { uint16_t hz; uint16_t ms; } chime_notes[] = {
+//     { 659,   40 }, // E5  - Blip inicial muy rápido
+//     { 831,   40 }, // G#5 - Blip intermedio
+//     { 988,   40 }, // B5  - Blip alto
+//     { 1319, 400 }  // E6  - Campana final que se desvanece suavemente
+// };
+
+static const struct { uint16_t hz; uint16_t ms; } chime_notes[] = {
+    { 880,  100 }, // A5  - (u)  La
+    { 1046, 100 }, // C6  - (Mi) Do
+    { 1397, 100 }, // F6  - (a)  Fa
+    { 1568, 400 }  // G6  - (a) Sol
+};
+
+#define CHIME_NOTE_COUNT ((int)(sizeof(chime_notes)/sizeof(chime_notes[0])))
+
+// Touched only by the audio thread, except chime_request.
+static struct {
+    int      playing;
+    int      note;
+    uint32_t phase;
+    uint32_t phase_inc;
+    int32_t  env;        // Q24
+    int32_t  env_rise;
+    int32_t  env_fall;
+    uint32_t attack;     // samples of attack left
+    uint32_t remain;     // samples left in this note
+} chime = {0};
+
+// Set on the emulation thread, consumed on the audio thread. A single word, so
+// the worst case is a trigger seen one callback late.
+static SDL_atomic_t chime_request;
+
+static void SND_chimeNote(int n) {
+    uint32_t rate = snd.sample_rate_out > 0 ? (uint32_t)snd.sample_rate_out : 44100;
+    uint32_t total = (uint32_t)((uint64_t)chime_notes[n].ms * rate / 1000);
+    uint32_t attack = (uint32_t)((uint64_t)CHIME_ATTACK_MS * rate / 1000);
+
+    if (total < 2) total = 2;
+        if (attack < 1) attack = 1;
+    if (attack > total/2) attack = total/2;
+
+    chime.note      = n;
+    chime.phase     = 0; // start on a zero crossing so the note cannot click in
+    chime.phase_inc = (uint32_t)(((uint64_t)chime_notes[n].hz << 32) / rate);
+    chime.env       = 0;
+    chime.env_rise  = CHIME_ENV_ONE / (int32_t)attack;
+    chime.env_fall  = CHIME_ENV_ONE / (int32_t)(total - attack);
+    chime.attack    = attack;
+    chime.remain    = total;
+}
+
+// Next chime sample, or 0 once it has finished. Advances the oscillator.
+static inline int32_t SND_chimeSample(void) {
+    int32_t env = chime.env >> CHIME_ENV_SHIFT;                  // Q24 -> Q15
+    int32_t s   = (chime_sine[chime.phase >> (32-CHIME_LUT_BITS)] * env) >> 15;
+
+    chime.phase += chime.phase_inc;
+
+    if (chime.attack) {
+        chime.attack--;
+        chime.env += chime.env_rise;
+        if (chime.env > CHIME_ENV_ONE) chime.env = CHIME_ENV_ONE;
+    }
+    else {
+        chime.env -= chime.env_fall;
+        if (chime.env < 0) chime.env = 0;
+    }
+
+    if (--chime.remain == 0) {
+        if (chime.note + 1 < CHIME_NOTE_COUNT) SND_chimeNote(chime.note + 1);
+        else chime.playing = 0;
+    }
+     return (s << CHIME_VOLUME) >> 8;
+}
+
+// Mix one chime sample into a stereo pair, clamping rather than wrapping.
+static inline void SND_chimeMix(int16_t* l, int16_t* r) {
+    int32_t c  = SND_chimeSample();
+    int32_t ml = *l + c;
+    int32_t mr = *r + c;
+    if (ml >  32767) ml =  32767; else if (ml < -32768) ml = -32768;
+    if (mr >  32767) mr =  32767; else if (mr < -32768) mr = -32768;
+    *l = (int16_t)ml;
+    *r = (int16_t)mr;
+}
+
+// Safe to call from any thread; never blocks, never allocates.
+void SND_playChime(void) {
+    SDL_AtomicSet(&chime_request, 1);
+}
+
 static void SND_audioCallback(void* userdata, uint8_t* stream, int len) { // plat_sound_callback
     if (snd.frame_count==0) return;
     
     int16_t *out = (int16_t *)stream;
     len /= (sizeof(int16_t) * 2);
-    
+
+    // Picked up here rather than in SND_batchSamples so the chime runs off the
+    // DAC clock: it stays in tune and in time even if the emulator stutters or
+    // the ring buffer underruns, and it never touches the emulation thread.
+    if (SDL_AtomicSet(&chime_request, 0)) {
+        SND_chimeNote(0);
+        chime.playing = 1;
+    }
+
     while (snd.frame_out!=snd.frame_in && len>0) {
-        *out++ = snd.buffer[snd.frame_out].left;
-        *out++ = snd.buffer[snd.frame_out].right;
-        
+        int16_t l = snd.buffer[snd.frame_out].left;
+        int16_t r = snd.buffer[snd.frame_out].right;
+        if (chime.playing) SND_chimeMix(&l, &r); // adds, never ducks
+
+        *out++ = l;
+        *out++ = r;
+
         snd.frame_filled = snd.frame_out;
         
         snd.frame_out += 1;
@@ -1006,9 +1232,16 @@ static void SND_audioCallback(void* userdata, uint8_t* stream, int len) { // pla
         if (snd.frame_out>=snd.frame_count) snd.frame_out = 0;
     }
     
+    // starved: the game is silent here, but the chime should still ring out
+    if (len>0) {
+        PROF_COUNT(PROF_AUDIO_STARVED, len);
+        snd.starved = 1;
+    }
     while (len>0) {
-        *out++ = 0;
-        *out++ = 0;
+        int16_t l = 0, r = 0;
+        if (chime.playing) SND_chimeMix(&l, &r);
+        *out++ = l;
+        *out++ = r;
         len -= 1;
     }
 }
@@ -1034,83 +1267,173 @@ static int SND_resampleNone(SND_Frame frame) { // audio_resample_passthrough
     if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
     return 1;
 }
-static int SND_resampleNear(SND_Frame frame) { // audio_resample_nearest
-    static int diff = 0;
-    int consumed = 0;
-
-    if (diff < snd.sample_rate_out) {
-        snd.buffer[snd.frame_in++] = frame;
-        if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
-        diff += snd.sample_rate_in;
+// Linear interpolation at a fractional step that can change between batches.
+// Replaces nearest-neighbour, which dropped or doubled whole samples. Emits at
+// most one output frame per call; returns 1 once `frame` is used up, 0 while
+// it's still needed for the next output frame.
+static int SND_resampleLinear(SND_Frame frame) {
+    if (snd.phase >= 0x10000) {
+        snd.phase -= 0x10000;
+        snd.prev = frame;
+        return 1;
     }
-
-    if (diff >= snd.sample_rate_out) {
-        consumed++;
-        diff -= snd.sample_rate_out;
-    }
-
-    return consumed;
-}
-static void SND_selectResampler(void) { // plat_sound_select_resampler
-    if (snd.sample_rate_in==snd.sample_rate_out) {
-        snd.resample =  SND_resampleNone;
-    }
-    else {
-        snd.resample = SND_resampleNear;
-    }
-}
-// With vsync a core runs at the panel's rate, not its own: a 60 fps core on a 60.46 Hz panel
-// makes 0.8% more audio than the card plays (the buffer fills and frames wait on it), on a
-// slower one less (underruns, pops). Scale the input rate by panel/core so the
-// resampler drops or repeats that difference. Only for cores within 3% of the panel rate
-// (a 50 Hz core is not paced by it). hz_x1000 = 0 restores the core's own rate.
-// Runs on the emulation thread, like the resampler, so it needs no lock.
-static void SND_panelRate(uint32_t hz_x1000) {
-    if (!snd.initialized || snd.fps_x1000 <= 0) return;
-    int rate = snd.base_rate_in;
-    if (hz_x1000) {
-        int64_t diff = (int64_t)hz_x1000 - snd.fps_x1000;
-        if (diff < 0) diff = -diff;
-        if (diff * 100 <= (int64_t)snd.fps_x1000 * 3)
-            rate = (int)((int64_t)snd.base_rate_in * hz_x1000 / snd.fps_x1000);
-    }
-    if (rate == snd.sample_rate_in) return;
-    int logged = rate - snd.sample_rate_in > 8 || snd.sample_rate_in - rate > 8 || !hz_x1000;
-    snd.sample_rate_in = rate;
-    SND_selectResampler();
-    if (logged) LOG_info("SND: panel %u mHz, core %i mHz: input rate %i (core %i)\n",
-                         hz_x1000, snd.fps_x1000, rate, snd.base_rate_in);
+    int64_t f = snd.phase;
+    SND_Frame out;
+    out.left  = (int16_t)(snd.prev.left  + (((int32_t)(frame.left  - snd.prev.left)  * f) >> 16));
+    out.right = (int16_t)(snd.prev.right + (((int32_t)(frame.right - snd.prev.right) * f) >> 16));
+    snd.buffer[snd.frame_in++] = out;
+    if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
+    snd.phase += snd.step;
+    return 0;
 }
 
+// How far from its own rate a core may run to keep step with the panel. 2%
+// covers every NTSC rate (59.73-60.10Hz) against this 60.46Hz panel, at a
+// pitch shift of at most a third of a semitone, and leaves PAL (50Hz) on the
+// audio clock.
+#define SND_MAX_SKEW 0.02
+// Proportional correction from the ring's fill on top of that, so it settles
+// at the target instead of filling up or running dry (RetroArch's
+// audio_rate_control_delta). Small enough to be inaudible.
+#define SND_RATE_DELTA 0.005
+
+// The fill it steers toward. Half full is ~41ms of latency, which cores with
+// steady frames hold indefinitely (GB/NES/SNES measured: never starved). A
+// core that stalls - PS disc reads, 70-100ms - starves at that, so a
+// starvation raises the target, to at most ~54ms, and it decays back over a
+// minute without one. The cap leaves room for what the gauge doesn't see: a
+// batch lands on top of the fill it steers by (16.7ms) and the callback
+// drains in 11.6ms steps, so the peak runs ~22ms above it.
+#define SND_TARGET_MIN   0.50
+#define SND_TARGET_MAX   0.65
+#define SND_TARGET_RAISE 0.15
+#define SND_TARGET_DECAY 0.00005 // per batch, ~60 a second
+
+// Frontend "Sync To": 1 lets SND_updateClock pick the video clock, 0 keeps the
+// audio clock always. Outside snd because the config is read before SND_init.
+static int snd_video_sync = 1;
+void SND_setVideoSync(int enabled) {
+    snd_video_sync = enabled ? 1 : 0;
+}
+
+int SND_isVideoClocked(void) {
+    return snd.initialized && snd.video_clocked;
+}
+
+// Who sets the pace, re-decided every batch.
+//
+// Audio clock (as before): the core runs at its own rate, the ring stays full
+// and SND_batchSamples blocks. Vsync then quantises those frames onto a panel
+// running at a slightly different rate, and every so often one refresh has no
+// new frame: a repeated frame, every 1.4s for GB.
+//
+// Video clock: when vsync is on and the rates are close, the swap paces the
+// emulator, one frame per refresh, and the audio is stretched to match - the
+// core's samples resampled by panel/core rate, plus a nudge from the ring's
+// fill. The ring never fills, so nothing blocks on it.
+static void SND_updateClock(void) {
+    double skew = GFX_getRefreshRate() / snd.frame_rate;
+    snd.video_clocked = snd_video_sync && gfx.vsync!=VSYNC_OFF && fabs(skew - 1.0) <= SND_MAX_SKEW;
+
+    double base  = (double)snd.sample_rate_in / snd.sample_rate_out;
+    double ratio = base;
+    if (snd.video_clocked) {
+        int fill = snd.frame_in - snd.frame_out;
+        if (fill < 0) fill += snd.frame_count;
+        double f = (double)fill / snd.frame_count; // 0 empty .. 1 full
+        ratio *= skew * (1.0 + SND_RATE_DELTA * 2.0 * (f - snd.target));
+    }
+    PROF_FP(PROF_FP_SKEW, skew);
+    PROF_FP(PROF_FP_RATIO, ratio);
+    snd.step = (uint32_t)(ratio * 65536.0 + 0.5);
+    snd.resample = (!snd.video_clocked && snd.sample_rate_in==snd.sample_rate_out)
+                 ? SND_resampleNone : SND_resampleLinear;
+    PROF_GAUGE(PROF_G_RATE_PPM, (int64_t)((ratio / base - 1.0) * 1e6));
+}
+// Consecutive waits with the ring still full before we give up on the audio
+// device. Each is ~10 SDL_Delay(1), so this is on the order of a second of no
+// drain at all -- far beyond any legitimate backlog of an 83ms ring buffer.
+#define SND_STALL_PASSES 100
+
+// Returns the number of input frames taken, per the libretro contract for
+// retro_audio_sample_batch_t. Most cores ignore it and assume everything was
+// consumed; the ones that don't (Mesen) resubmit whatever they think is left,
+// so getting this wrong is catastrophic rather than cosmetic: returning 1 for
+// a 734 frame batch made Mesen hand back 733, then 732, then 731... 734 calls
+// and 269,745 frames for a single video frame, which is six seconds of audio
+// the ring then has to drain in real time. That is a 0.2fps emulator.
 size_t SND_batchSamples(const SND_Frame* frames, size_t frame_count) { // plat_sound_write / plat_sound_write_resample
     if (snd.frame_count==0) return 0;
     
     SDL_LockAudio();
+    SND_updateClock();
 
-    int consumed = 0;
+    // Under the video clock the core can't run ahead to refill the ring after
+    // a stall (a PS disc read took 71ms), and the rate correction alone takes
+    // 15-20s to win back what was lost, leaving every later hiccup to starve
+    // it again. The callback has already played silence by now, so top the
+    // ring up to its target with more of it: one slightly longer gap instead
+    // of seconds of running on empty.
+    int fill = snd.frame_in - snd.frame_out;
+    if (fill < 0) fill += snd.frame_count;
+    if (snd.video_clocked && snd.starved) {
+        // only a ring that was healthy and then ran dry says the core stalls;
+        // one that was already empty is just starting up or back from the menu
+        if (snd.last_fill > 0.25) snd.target = MIN(SND_TARGET_MAX, snd.target + SND_TARGET_RAISE);
+        for (int pad = (int)(snd.frame_count * snd.target) - fill; pad > 0 && snd.frame_in != snd.frame_filled; pad--) {
+            snd.buffer[snd.frame_in++] = (SND_Frame){0, 0};
+            if (snd.frame_in >= snd.frame_count) snd.frame_in = 0;
+        }
+    }
+    else if (snd.target > SND_TARGET_MIN) {
+        snd.target = MAX(SND_TARGET_MIN, snd.target - SND_TARGET_DECAY);
+    }
+    snd.starved = 0;
+    snd.last_fill = (double)fill / snd.frame_count;
+
+    // how much audio is queued ahead of the DAC as this batch arrives
+    PROF_GAUGE(PROF_G_RING_US, (int64_t)((snd.frame_in - snd.frame_out + (int)snd.frame_count) % (int)snd.frame_count)
+                               * 1000000 / (snd.sample_rate_out ? snd.sample_rate_out : 1));
+
+    size_t taken = 0;
+    int stalled = 0;
     while (frame_count > 0) {
         int tries = 0;
         int amount = MIN(BATCH_SIZE, frame_count);
 
         while (tries < 10 && snd.frame_in==snd.frame_filled) {
             tries++;
+            PROF_COUNT(PROF_AUDIO_SLEEPS, 1);
             SDL_UnlockAudio();
-            uint32_t w0 = SDL_GetTicks();
             SDL_Delay(1);
-            PLAT_perfAudioWait(SDL_GetTicks() - w0);
             SDL_LockAudio();
         }
 
+        // Blocking here is deliberate -- the ring draining at the DAC rate is
+        // what paces the emulator. But if it never drains the device has died,
+        // and waiting forever takes the whole emulator down with it. Hand back
+        // a short count instead: the core keeps the rest, and the worst case
+        // is dropped audio rather than a frozen game.
+        if (snd.frame_in==snd.frame_filled) {
+            if (++stalled >= SND_STALL_PASSES) break;
+            continue;
+        }
+        stalled = 0;
+
         while (amount && snd.frame_in != snd.frame_filled) {
-            consumed = snd.resample(*frames);
-            frames += consumed;
-            amount -= consumed;
+            // 0 is legitimate when upsampling: the resampler wrote an output
+            // frame but is not done with this input frame yet. frame_in still
+            // advances, so the ring fills and this loop always terminates.
+            int consumed = snd.resample(*frames);
+            frames      += consumed;
+            amount      -= consumed;
             frame_count -= consumed;
+            taken       += consumed;
         }
     }
     SDL_UnlockAudio();
     
-    return consumed;
+    return taken;
 }
 
 void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
@@ -1144,13 +1467,11 @@ void SND_init(double sample_rate, double frame_rate) { // plat_sound_init
     
     snd.buffer_seconds = 5;
     snd.sample_rate_in  = sample_rate;
-    snd.base_rate_in    = sample_rate;
-    snd.fps_x1000       = (int)(frame_rate * 1000 + 0.5);
     snd.sample_rate_out = spec_out.freq;
     
-    SND_selectResampler();
+    snd.target = SND_TARGET_MIN;
     SND_resizeBuffer();
-    if (panel.hz_x1000) SND_panelRate(panel.hz_x1000); // already measured (menus before the game)
+    SND_updateClock();
     
     SDL_PauseAudio(0);
 
@@ -1287,7 +1608,8 @@ void PAD_poll(void) {
                 btn = 1 << id;
                 if (state==0) {
                     pad.is_pressed        &= ~btn; // unset
-                    pad.just_repeated    &= ~btn; // unset
+                    // a tap that came and went within one poll still counts once
+                    if (!(pad.just_pressed & btn)) pad.just_repeated &= ~btn; // unset
                     pad.just_released    |= btn; // set
                 }
                 else if (state==1 && (pad.is_pressed & btn)==BTN_NONE) {
@@ -1328,7 +1650,8 @@ void PAD_poll(void) {
         
         if (!pressed) {
             pad.is_pressed        &= ~btn; // unset
-            pad.just_repeated    &= ~btn; // unset
+            // a tap that came and went within one poll still counts once
+            if (!(pad.just_pressed & btn)) pad.just_repeated &= ~btn; // unset
             pad.just_released    |= btn; // set
         }
         else if ((pad.is_pressed & btn)==BTN_NONE) {
@@ -1367,46 +1690,257 @@ int PAD_tappedMenu(uint32_t now) {
 static struct VIB_Context {
     int initialized;
     pthread_t pt;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond; // queued_strength changed, or quit
     int queued_strength;
-    int strength;
+    int strength;         // what the motor was last told
+    int quit;
 } vib = {0};
 
-static void* VIB_thread(void *arg) {
-#define DEFER_FRAMES 3
-    static int defer = 0;
-    while(1) {
-        SDL_Delay(17);
-        if (vib.queued_strength!=vib.strength) {
-            if (defer<DEFER_FRAMES && vib.queued_strength==0) { // minimize vacillation between 0 and some number (which this motor doesn't like)
-                defer += 1;
-                continue;
-            }
-            vib.strength = vib.queued_strength;
-            defer = 0;
+// The motor doesn't like flicking between 0 and some strength, so a request
+// to stop is held this long in case a new strength follows straight after.
+// Same as the old polling loop: 3 ticks of 17ms.
+#define VIB_STOP_DELAY_MS 51
 
-            PLAT_setRumble(vib.strength);
+// Sleeps until there is something to do, instead of waking every 17ms for the
+// whole session. A new non-zero strength reaches the motor at once rather
+// than on the next tick.
+static void* VIB_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&vib.lock);
+    while (!vib.quit) {
+        if (vib.queued_strength==vib.strength) {
+            pthread_cond_wait(&vib.cond, &vib.lock);
+            continue;
         }
+        if (vib.queued_strength==0) {
+            struct timespec until;
+            clock_gettime(CLOCK_MONOTONIC, &until);
+            until.tv_nsec += VIB_STOP_DELAY_MS * 1000000L;
+            if (until.tv_nsec>=1000000000L) { until.tv_nsec -= 1000000000L; until.tv_sec += 1; }
+            while (!vib.quit && vib.queued_strength==0) {
+                if (pthread_cond_timedwait(&vib.cond, &vib.lock, &until)==ETIMEDOUT) break;
+            }
+            if (vib.quit) break;
+            if (vib.queued_strength!=0) continue; // a new strength arrived, start over with it
+        }
+        int strength = vib.queued_strength;
+        vib.strength = strength;
+        pthread_mutex_unlock(&vib.lock);
+        PLAT_setRumble(strength); // a sysfs write: not under the lock
+        pthread_mutex_lock(&vib.lock);
     }
+    pthread_mutex_unlock(&vib.lock);
     return 0;
 }
 void VIB_init(void) {
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC); // the stop delay mustn't follow wall clock changes
+    pthread_cond_init(&vib.cond, &attr);
+    pthread_condattr_destroy(&attr);
+    pthread_mutex_init(&vib.lock, NULL);
+
     vib.queued_strength = vib.strength = 0;
+    vib.quit = 0;
     pthread_create(&vib.pt, NULL, &VIB_thread, NULL);
     vib.initialized = 1;
 }
 void VIB_quit(void) {
     if (!vib.initialized) return;
-    
-    VIB_setStrength(0);
-    pthread_cancel(vib.pt);
+
+    pthread_mutex_lock(&vib.lock);
+    vib.queued_strength = 0;
+    vib.quit = 1;
+    pthread_cond_signal(&vib.cond);
+    pthread_mutex_unlock(&vib.lock);
     pthread_join(vib.pt, NULL);
+
+    // stop it now, without the delay: there's nothing left to wait for, and
+    // the old version could exit with the motor still running
+    if (vib.strength) {
+        PLAT_setRumble(0);
+        vib.strength = 0;
+    }
+    vib.initialized = 0;
 }
 void VIB_setStrength(int strength) {
-    if (vib.queued_strength==strength) return;
+    if (vib.queued_strength==strength) return; // cores call this every frame; most calls change nothing
+    if (!vib.initialized) {
+        vib.queued_strength = strength;
+        return;
+    }
+    pthread_mutex_lock(&vib.lock);
     vib.queued_strength = strength;
+    pthread_cond_signal(&vib.cond);
+    pthread_mutex_unlock(&vib.lock);
 }
 int VIB_getStrength(void) {
     return vib.strength;
+}
+
+// -------------------------------------------------------------------------
+// IO - Save data written off the emulation thread
+// -------------------------------------------------------------------------
+//
+// Measured on this card (ext4, mounted discard,nodelalloc): a 4MiB PS state
+// takes ~300ms to write and fsync, and sync() after an 8KiB sram costs 250ms
+// if anything else is still dirty. Done inline that is 20+ dropped frames, so
+// the writes go to a worker and the emulation thread only pays for a memcpy.
+
+typedef struct IO_Job {
+    struct IO_Job* next;
+    void*  data;
+    size_t size;
+    char   path[MAX_PATH];
+} IO_Job;
+
+static struct IO_Context {
+    pthread_mutex_t lock;
+    pthread_cond_t  work; // a job was queued, or it's time to quit
+    pthread_cond_t  idle; // the queue drained
+    IO_Job* head;
+    IO_Job* tail;
+    int busy;             // the worker is writing a job it already took off the queue
+    int running;
+    int quit;
+    pthread_t thread;
+} io = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .work = PTHREAD_COND_INITIALIZER,
+    .idle = PTHREAD_COND_INITIALIZER,
+};
+
+int IO_writeFileNow(const char* path, const void* data, size_t size) {
+    char tmp[MAX_PATH + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        LOG_error("IO: can't open %s: %s\n", tmp, strerror(errno));
+        return -1;
+    }
+
+    const uint8_t* p = data;
+    size_t left = size;
+    while (left) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        p += n;
+        left -= n;
+    }
+    int ok = (left == 0) && fsync(fd) == 0;
+    if (close(fd) != 0) ok = 0;
+
+    if (!ok || rename(tmp, path) != 0) {
+        LOG_error("IO: writing %s failed: %s\n", path, strerror(errno));
+        unlink(tmp); // the old file, if any, is still intact
+        return -1;
+    }
+
+    // the rename is a change to the directory, so that has to reach the card too
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char* slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = '\0'; // file in /
+        else slash[0] = '\0';
+        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            fsync(dfd);
+            close(dfd);
+        }
+    }
+    return 0;
+}
+
+static void* IO_thread(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&io.lock);
+    for (;;) {
+        while (!io.head && !io.quit) pthread_cond_wait(&io.work, &io.lock);
+        if (!io.head) break; // quitting, and nothing left to write
+
+        IO_Job* job = io.head;
+        io.head = job->next;
+        if (!io.head) io.tail = NULL;
+        io.busy = 1;
+        pthread_mutex_unlock(&io.lock);
+
+        IO_writeFileNow(job->path, job->data, job->size);
+        free(job->data);
+        free(job);
+
+        pthread_mutex_lock(&io.lock);
+        io.busy = 0;
+        if (!io.head) pthread_cond_broadcast(&io.idle);
+    }
+    pthread_mutex_unlock(&io.lock);
+    return NULL;
+}
+
+void IO_writeFile(const char* path, void* data, size_t size) {
+    IO_Job* job = malloc(sizeof(IO_Job));
+    if (job) {
+        job->next = NULL;
+        job->data = data;
+        job->size = size;
+        snprintf(job->path, sizeof(job->path), "%s", path);
+
+        pthread_mutex_lock(&io.lock);
+        if (!io.running && pthread_create(&io.thread, NULL, IO_thread, NULL) == 0) io.running = 1;
+        if (io.running) {
+            // A newer copy of a file that is still waiting replaces it, so
+            // saving the same slot twice in a row only writes once. One that
+            // is already being written isn't in the queue: this goes after it.
+            for (IO_Job* j = io.head; j; j = j->next) {
+                if (strcmp(j->path, job->path)) continue;
+                free(j->data);
+                j->data = data;
+                j->size = size;
+                pthread_mutex_unlock(&io.lock);
+                free(job);
+                return;
+            }
+            if (io.tail) io.tail->next = job;
+            else io.head = job;
+            io.tail = job;
+            pthread_cond_signal(&io.work);
+            pthread_mutex_unlock(&io.lock);
+            return;
+        }
+        pthread_mutex_unlock(&io.lock);
+        free(job);
+    }
+
+    // no worker: still atomic, just not in the background
+    IO_writeFileNow(path, data, size);
+    free(data);
+}
+
+void IO_flush(void) {
+    pthread_mutex_lock(&io.lock);
+    while (io.head || io.busy) pthread_cond_wait(&io.idle, &io.lock);
+    pthread_mutex_unlock(&io.lock);
+}
+
+void IO_quit(void) {
+    pthread_mutex_lock(&io.lock);
+    if (!io.running) {
+        pthread_mutex_unlock(&io.lock);
+        return;
+    }
+    io.quit = 1;
+    pthread_cond_signal(&io.work);
+    pthread_mutex_unlock(&io.lock);
+
+    pthread_join(io.thread, NULL); // drains the queue first
+
+    io.running = 0;
+    io.quit = 0;
 }
 
 // -------------------------------------------------------------------------
@@ -1416,11 +1950,10 @@ int VIB_getStrength(void) {
 static void PWR_initOverlay(void) {
     // setup surface
     pwr.overlay = PLAT_initOverlay();
+    if (!pwr.overlay) return;
 
     // draw battery
-    SDLX_SetAlpha(gfx.assets, 0,0);
     GFX_blitAsset(ASSET_BLACK_PILL, NULL, pwr.overlay, NULL);
-    SDLX_SetAlpha(gfx.assets, SDL_SRCALPHA,0);
     GFX_blitBattery(pwr.overlay, NULL);
 }
 
@@ -1512,12 +2045,18 @@ void PWR_update(int* _dirty, int* _show_setting, PWR_callback_t before_sleep, PW
         power_pressed_at = now;
     }
     
-    // Handle Sleep
-    #define SLEEP_DELAY 120000 // 120 seconds
-    if (now-last_input_at>=SLEEP_DELAY && PWR_preventAutosleep()) last_input_at = now;
+    // Handle Sleep, after the time set in the Quick Menu (0: never)
+    static const uint32_t sleep_delays[] = {0, 60000, 120000, 300000, 600000};
+    int sleep_i = GetAutoSleep();
+    uint32_t sleep_delay = sleep_i>=0 && sleep_i<5 ? sleep_delays[sleep_i] : 120000;
+    int idle = sleep_delay && now-last_input_at>=sleep_delay;
+    if (idle && PWR_preventAutosleep()) {
+        last_input_at = now;
+        idle = 0;
+    }
     
     if (
-        now-last_input_at>=SLEEP_DELAY || // autosleep
+        idle || // autosleep
         (pwr.can_sleep && PAD_justReleased(BTN_SLEEP)) // manual sleep
     ) {
         if (before_sleep) before_sleep();
@@ -1579,27 +2118,16 @@ void PWR_disablePowerOff(void) {
 }
 void PWR_powerOff(void) {
     if (pwr.can_poweroff) {
-        
-        int w = FIXED_WIDTH;
-        int h = FIXED_HEIGHT;
-        int p = FIXED_PITCH;
-        if (GetHDMI()) {
-            w = HDMI_WIDTH;
-            h = HDMI_HEIGHT;
-            p = HDMI_PITCH;
-        }
-        gfx.screen = GFX_resize(w,h,p);
-        
         char* msg;
         if (HAS_POWER_BUTTON || HAS_POWEROFF_BUTTON) msg = exists(AUTO_RESUME_PATH) ? "Quicksave created,\npowering off" : "Powering off";
         else msg = exists(AUTO_RESUME_PATH) ? "Quicksave created,\npower off now" : "Power off now";
         
-        // LOG_info("PWR_powerOff %s (%ix%i)\n", gfx.screen, gfx.screen->w, gfx.screen->h);
-        
-        // TODO: for some reason screen's dimensions end up being 0x0 in GFX_blitMessage...
+        PLAT_setUILayer(1); // a game may have it switched off
         PLAT_clearVideo(gfx.screen);
         GFX_blitMessage(font.large, msg, gfx.screen,&(SDL_Rect){0,0,gfx.screen->w,gfx.screen->h}); //, NULL);
         GFX_flip(gfx.screen);
+        IO_flush(); // the quicksave before_sleep just queued has to be on the card first
+        NB_flushToCard(); // NekoBit's RAM (tmpfs) state, from minui or a game alike
         PLAT_powerOff();
     }
 }
@@ -1637,6 +2165,8 @@ static void PWR_waitForWake(void) {
     SDL_Event event;
     int wake = 0;
     uint32_t sleep_ticks = SDL_GetTicks();
+    int off_i = GetSleepPowerOff(); // 5, 10 or 15 minutes asleep
+    uint32_t off_after = (off_i>=0 && off_i<3 ? off_i + 1 : 1) * 300000;
     while (!wake) {
         while (SDL_PollEvent(&event)) {
             if (event.type==SDL_KEYUP) {
@@ -1661,7 +2191,7 @@ static void PWR_waitForWake(void) {
             } 
         }
         SDL_Delay(200);
-        if (pwr.can_poweroff && SDL_GetTicks()-sleep_ticks>=300000) { // five minutes
+        if (pwr.can_poweroff && SDL_GetTicks()-sleep_ticks>=off_after) {
             if (pwr.is_charging) sleep_ticks += 60000; // check again in a minute
             else PWR_powerOff();
         }
@@ -1684,6 +2214,28 @@ void PWR_enableAutosleep(void) {
 }
 int PWR_preventAutosleep(void) {
     return pwr.is_charging || !pwr.can_autosleep;
+}
+
+static int usb_mode = -1;
+int USB_getMode(void) {
+    if (usb_mode<0) {
+        char mode[16] = {0};
+        if (exists(USB_MODE_PATH)) getFile(USB_MODE_PATH, mode, sizeof(mode));
+        usb_mode = !strncmp(mode, "net-only", 8) ? USB_MODE_NET_ONLY
+                 : !strncmp(mode, "net", 3) ? USB_MODE_NET
+                 : !strncmp(mode, "adb", 3) ? USB_MODE_ADB : USB_MODE_NONE;
+    }
+    return usb_mode;
+}
+void USB_setMode(int mode) {
+    usb_mode = mode;
+    putFile(USB_MODE_PATH, mode==USB_MODE_NET_ONLY ? "net-only" : mode==USB_MODE_NET ? "net" : mode==USB_MODE_ADB ? "adb" : "");
+}
+void USB_reloadMode(void) {
+    usb_mode = -1;
+}
+int USB_hasNetwork(int mode) {
+    return mode==USB_MODE_NET || mode==USB_MODE_NET_ONLY;
 }
 
 // updated by PWR_updateBatteryStatus()

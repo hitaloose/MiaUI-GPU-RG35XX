@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
@@ -20,6 +21,7 @@
 
 #include "defines.h"
 #include "platform.h"
+#include "profile.h"
 #include "api.h"
 #include "utils.h"
 
@@ -27,11 +29,18 @@
 // Global Contexts & Structs
 // -------------------------------------------------------------------------
 
-static struct OVL_Context {
+// the battery pill: a ui render target, drawn once by PWR_init
+static struct {
+	SDL_Surface* surface;
+	int enabled;
+} ovl;
+
+// the game overlay (bezel), an image
+static struct {
 	SDL_Surface* surface;
 	GLuint tex;
 	int enabled;
-} ovl, ovl_game;
+} ovl_game;
 
 #define MODE_565F 1
 #define MODE_444A 2
@@ -40,6 +49,7 @@ static struct OVL_Context {
 // Forward declarations
 void PLAT_initSurfaceOverlay(const char* filename, int mode);
 void PLAT_quitGameOverlay(void);
+static void PLAT_quitToast(void);
 
 // funciona regular por que en DOSBOX aparece mucha espera y no tiene sentido, pero es un comienzo.
 //#define PROFILE_GPU 1
@@ -139,7 +149,7 @@ void printGLString(const char *name, GLenum s) {
 static struct VID_Context {
 	SDL_Window* window;
 	SDL_GLContext context;
-	SDL_Surface* screen;    // Main surface (UI)
+	SDL_Surface* screen;    // the ui layer, a render target (see "UI, drawn by the GPU")
 
 	GLuint program;
 	GLuint vbo_screen;      // VBO for the UI/Screen quad
@@ -147,16 +157,10 @@ static struct VID_Context {
 	GLuint vbo_game_overlay;// VBO for Game Overlay (e.g. bezels)
 	GLuint vbo_overlay;     // VBO for UI Overlay (e.g. battery, pills)
 	GLuint ibo;             // Shared Index Buffer
-	GLuint screen_tex;      // Texture for UI
+	GLuint screen_tex;      // the ui layer's texture
 	GLuint game_tex;        // Texture for Emulator content
 	GLint u_projection;
 	GLint u_brightness_loc;
-
-	void* pixels;           // Raw pixel buffer for the screen surface (double buffered)
-	int page;               // Current buffer page index (0 or 1)
-	int width;
-	int height;
-	int pitch;
 
 	int clip_x;
 	int clip_y;
@@ -164,20 +168,8 @@ static struct VID_Context {
 	int clip_h;
 
 	int nearest;            // Filtering mode: 1=Nearest, 0=Linear
-	int cleared;            // Flag to indicate if screen was cleared
-
-	int swap_interval;      // Swap interval currently set on the GL context
-	int ui_in_game;         // 1 = UI layer has content over the game (debug HUD)
-	int ui_drawn;           // 1 = screen_tex holds what the last flip showed
+	GLint game_filter;      // last filter set on the game layer, for a texture that takes its place
 } vid;
-
-// eglSwapBuffers blocks until vsync on this driver, so the interval is what
-// "Lenient" has to change: only call into EGL when it actually changes.
-static void set_swap_interval(int interval) {
-	if (interval == vid.swap_interval) return;
-	SDL_GL_SetSwapInterval(interval);
-	vid.swap_interval = interval;
-}
 
 // Struct to track game blit state for optimized texture updates
 static struct {
@@ -186,11 +178,49 @@ static struct {
 	uint32_t dw, dh, dp; // Destination width, height, pitch
 	int dx, dy;          // Destination x, y
 	int bpp;
+	int repeat;          // 1 = draw the cached frame on the next flip (core sent no new one)
 	int dirty;           // 1 = game geometry changed, VBO needs rebuild
 	uint32_t last_sw;    // Previous source width (to detect resize)
 	uint32_t last_sh;    // Previous source height
 	uint32_t last_stride_w;
+	// How the source goes to GL, decided once per scaler selection rather
+	// than per frame: RGB565 at alignment 1, or XRGB8888 as BGRA at 4.
+	GLenum gl_format;
+	GLenum gl_type;
+	GLint align;
 } gles_blit;
+
+// GL_BGRA_EXT from GL_EXT_texture_format_BGRA8888. XRGB8888 is B,G,R,X in
+// memory on little endian, and GLES2 has no core BGRA, so without this
+// extension a 32-bit core would need a swizzle in the fragment shader.
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1
+#endif
+
+// Hardware rendering state (--gl), see PLAT_hwInit
+static struct {
+	GLuint fbo;
+	GLuint tex;      // the FBO's colour, which becomes the game layer
+	GLuint depth;    // depth (and stencil) renderbuffer, 0 if the core wants neither
+	GLuint sw_tex;   // the software game texture, set aside while tex is in its place
+	int w, h;        // allocated size
+	int bottom_left; // the core draws with GL's own origin, first row at the bottom
+	int presenting;  // frames are the FBO's (0: the core sent software ones)
+	int dirty;       // the game VBO needs rebuilding for the FBO's texture rect
+	GFX_Renderer* renderer; // where scale_hw finds the crop, from PLAT_getScaler
+	GLint max_attribs;
+	PFNGLBINDVERTEXARRAYOESPROC bind_vao; // NULL without OES_vertex_array_object
+} hw;
+
+static int video_flags = 0;  // PLAT_VIDEO_*, from PLAT_setVideoFlags
+static int gles_has_bgra = 0; // only looked up with PLAT_VIDEO_32BIT
+
+void PLAT_setVideoFlags(int flags) {
+	// GL output always comes with the 32-bit window
+	if (flags & PLAT_VIDEO_GL) flags |= PLAT_VIDEO_32BIT;
+	video_flags = flags;
+}
+int PLAT_supports32Bit(void) { return gles_has_bgra; }
 
 /**
  * Uploads vertex data for a quad (x, y, w, h) to a specific VBO.
@@ -212,6 +242,20 @@ static void upload_quad_vbo(GLuint vbo, float x, float y, float w, float h) {
 	upload_quad_vbo_uv(vbo, x, y, w, h, 1.0f, 1.0f);
 }
 
+// Same quad, any texture rect: v_top is what the top edge samples, so a
+// bottom-up image is just v_top > v_bottom.
+static void upload_quad_vbo_rect(GLuint vbo, float x, float y, float w, float h,
+                                 float u_left, float v_top, float u_right, float v_bottom) {
+	GLfloat vertices[] = {
+		x,     y,     0.0f,   u_left,  v_top,
+		x,     y + h, 0.0f,   u_left,  v_bottom,
+		x + w, y + h, 0.0f,   u_right, v_bottom,
+		x + w, y,     0.0f,   u_right, v_top
+	};
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+}
+
 /**
  * Draws a quad using the specified VBO and Texture.
  * Binds VBO, sets up attrib pointers, binds texture, and calls glDrawElements.
@@ -227,7 +271,6 @@ static void draw_cached_quad(GLuint vbo, GLuint texture) {
 }
 
 #define MASK_RGB565   0xF800, 0x07E0, 0x001F, 0x0000
-#define MASK_RGBA4444 0xF000, 0x0F00, 0x00F0, 0x000F
 
 
 // -------------------------------------------------------------------------
@@ -264,6 +307,376 @@ void PLAT_quitInput(void) {
 }
 
 // -------------------------------------------------------------------------
+// UI, drawn by the GPU
+// -------------------------------------------------------------------------
+//
+// Everything that isn't the game picture is drawn by the GPU into render
+// targets: RGBA8 textures behind FBOs, handed out as SDL_Surfaces that have a
+// size but no pixels (userdata is the target). The screen layer GFX_init
+// returns is one, and so are the achievement toast and the battery pill;
+// PLAT_flip composites them over the game like it always has.
+//
+// This replaces a 4444 surface drawn by SDL and uploaded whole on every flip.
+// SDL has no fast blitters for 4444: at the menu clock a text row cost 5.5ms,
+// a background 33ms and a thumbnail 30-37ms, so a list redraw was 55-90ms of
+// CPU. Now it is ~1ms.
+//
+// Colour is premultiplied by alpha everywhere: textures on upload, what the
+// shaders write, what the targets hold. So every draw and every composite is
+// the one blend, ONE / ONE_MINUS_SRC_ALPHA, and a target drawn into another
+// one blends exactly like the pieces it was made of.
+//
+// Three small programs rather than one with branches, since the SGX pays for
+// a branch on every pixel: RGBA textures, 8-bit alpha textures tinted with
+// one colour (text), and flat colour (fills). Quads go out one at a time from
+// a client-side array: a list screen is ~50 of them, drawn only when it
+// changes.
+
+#define UI_TARGET_MAGIC 0x47544955 // "UITG"
+typedef struct {
+	uint32_t magic;
+	GLuint tex;
+	GLuint fbo;
+} UI_Target;
+
+enum { UI_PROG_RGBA, UI_PROG_ALPHA, UI_PROG_FILL, UI_PROG_COUNT };
+
+static struct {
+	GLuint prog[UI_PROG_COUNT];
+	GLint xform[UI_PROG_COUNT];   // u_xform of each
+	int xform_w[UI_PROG_COUNT];   // the target size each u_xform is set for
+	int xform_h[UI_PROG_COUNT];
+	GLuint current;     // program in use while bound
+	SDL_Surface* bound; // the target being drawn into, NULL: the window's state
+} ui;
+
+static const char* ui_vertex_source =
+	"uniform vec4 u_xform;\n" // scale.xy, offset.zw: pixels to clip space
+	"attribute vec2 a_pos;\n"
+	"attribute vec2 a_uv;\n"
+	"attribute vec4 a_color;\n" // premultiplied: tint * opacity, opacity
+	"varying vec2 v_uv;\n"
+	"varying vec4 v_color;\n"
+	"void main() {\n"
+	"  gl_Position = vec4(a_pos * u_xform.xy + u_xform.zw, 0.0, 1.0);\n"
+	"  v_uv = a_uv;\n"
+	"  v_color = a_color;\n"
+	"}\n";
+
+static const char* ui_fragment_sources[UI_PROG_COUNT] = {
+	[UI_PROG_RGBA] =
+		"precision mediump float;\n"
+		"varying vec2 v_uv;\n"
+		"varying vec4 v_color;\n"
+		"uniform sampler2D s_texture;\n"
+		"void main() { gl_FragColor = texture2D(s_texture, v_uv) * v_color; }\n",
+	[UI_PROG_ALPHA] =
+		"precision mediump float;\n"
+		"varying vec2 v_uv;\n"
+		"varying vec4 v_color;\n"
+		"uniform sampler2D s_texture;\n"
+		"void main() { gl_FragColor = v_color * texture2D(s_texture, v_uv).a; }\n",
+	[UI_PROG_FILL] =
+		"precision mediump float;\n"
+		"varying vec4 v_color;\n"
+		"void main() { gl_FragColor = v_color; }\n",
+};
+
+static GLuint ui_program(const char* fragment_source) {
+	GLuint vs = compile_shader(GL_VERTEX_SHADER, ui_vertex_source);
+	GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+	if (!vs || !fs) return 0;
+	GLuint program = glCreateProgram();
+	glAttachShader(program, vs);
+	glAttachShader(program, fs);
+	glBindAttribLocation(program, 0, "a_pos");
+	glBindAttribLocation(program, 1, "a_uv");
+	glBindAttribLocation(program, 2, "a_color");
+	glLinkProgram(program);
+	glDeleteShader(vs);
+	glDeleteShader(fs);
+	GLint success;
+	glGetProgramiv(program, GL_LINK_STATUS, &success);
+	if (!success) {
+		GLchar log[512];
+		glGetProgramInfoLog(program, sizeof(log), NULL, log);
+		fprintf(stderr, "ui program link error: %s\n", log);
+		glDeleteProgram(program);
+		return 0;
+	}
+	glUseProgram(program);
+	GLint sampler = glGetUniformLocation(program, "s_texture");
+	if (sampler >= 0) glUniform1i(sampler, 0);
+	return program;
+}
+
+static int ui_init(void) {
+	for (int i = 0; i < UI_PROG_COUNT; i++) {
+		ui.prog[i] = ui_program(ui_fragment_sources[i]);
+		if (!ui.prog[i]) return 0;
+		ui.xform[i] = glGetUniformLocation(ui.prog[i], "u_xform");
+	}
+	glUseProgram(vid.program);
+	return 1;
+}
+
+static void ui_quit(void) {
+	for (int i = 0; i < UI_PROG_COUNT; i++) {
+		if (ui.prog[i]) glDeleteProgram(ui.prog[i]);
+	}
+	memset(&ui, 0, sizeof(ui));
+}
+
+static UI_Target* ui_target(SDL_Surface* s) {
+	UI_Target* t = s ? s->userdata : NULL;
+	return (t && t->magic == UI_TARGET_MAGIC) ? t : NULL;
+}
+
+// back to the state the rest of this file takes for granted
+static void ui_unbind(void) {
+	if (!ui.bound) return;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
+	glUseProgram(vid.program);
+	ui.bound = NULL;
+	ui.current = 0;
+}
+
+static UI_Target* ui_bind(SDL_Surface* dst) {
+	UI_Target* t = ui_target(dst);
+	if (!t || ui.bound == dst) return t;
+	if (!ui.bound) {
+		glBindBuffer(GL_ARRAY_BUFFER, 0); // quads come from client memory
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+	glViewport(0, 0, dst->w, dst->h);
+	ui.bound = dst;
+	return t;
+}
+
+static void ui_quad(SDL_Surface* dst, int prog, GLuint tex, float x, float y, float w, float h,
+                    float u0, float v0, float u1, float v1, SDL_Color c, int opacity) {
+	if (!ui_bind(dst)) return;
+	if (ui.current != ui.prog[prog]) {
+		ui.current = ui.prog[prog];
+		glUseProgram(ui.current);
+	}
+	// row 0 of every target is the top of it: y=0 goes to clip -1, which is
+	// the FBO's first row, and the quads that composite them sample v=0 at
+	// the top
+	if (ui.xform_w[prog] != dst->w || ui.xform_h[prog] != dst->h) {
+		ui.xform_w[prog] = dst->w;
+		ui.xform_h[prog] = dst->h;
+		glUniform4f(ui.xform[prog], 2.0f / dst->w, 2.0f / dst->h, -1.0f, -1.0f);
+	}
+	GLfloat v[] = {
+		x,     y,     u0, v0,
+		x,     y + h, u0, v1,
+		x + w, y + h, u1, v1,
+		x,     y,     u0, v0,
+		x + w, y + h, u1, v1,
+		x + w, y,     u1, v0,
+	};
+	if (tex) glBindTexture(GL_TEXTURE_2D, tex);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), v + 2);
+	// one colour for the whole quad: a constant attribute, not an array.
+	// SDL_Color's own alpha is ignored, as SDL ignores it for text and fills
+	// (the COLOR_* literals leave it 0); opacity is what fades a draw.
+	float o = opacity / 255.0f;
+	glVertexAttrib4f(2, c.r / 255.0f * o, c.g / 255.0f * o, c.b / 255.0f * o, o);
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+static GLuint ui_texture(GLenum format, GLenum type, int align, int w, int h, const void* pixels) {
+	GLuint tex;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+	glTexImage2D(GL_TEXTURE_2D, 0, format, w, h, 0, format, type, pixels);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	return tex;
+}
+
+SDL_Surface* PLAT_uiCreateSurface(int w, int h) {
+	if (w <= 0 || h <= 0) return NULL;
+	UI_Target* t = calloc(1, sizeof(UI_Target));
+	SDL_Surface* s = t ? SDL_CreateRGBSurfaceWithFormatFrom(NULL, w, h, 32, w * 4, SDL_PIXELFORMAT_ABGR8888) : NULL;
+	if (!s) {
+		free(t);
+		return NULL;
+	}
+	ui_unbind(); // what is bound below is put back by the next draw
+	t->magic = UI_TARGET_MAGIC;
+	t->tex = ui_texture(GL_RGBA, GL_UNSIGNED_BYTE, 4, w, h, NULL);
+	glGenFramebuffers(1, &t->fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->tex, 0);
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status == GL_FRAMEBUFFER_COMPLETE) {
+		glViewport(0, 0, w, h);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // its first contents are undefined
+		glClear(GL_COLOR_BUFFER_BIT);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		fprintf(stderr, "ui: %ix%i render target incomplete (0x%x)\n", w, h, status);
+		glDeleteFramebuffers(1, &t->fbo);
+		glDeleteTextures(1, &t->tex);
+		free(t);
+		SDL_FreeSurface(s);
+		return NULL;
+	}
+	s->userdata = t;
+	return s;
+}
+
+void PLAT_uiFreeSurface(SDL_Surface* s) {
+	UI_Target* t = ui_target(s);
+	if (!t) return;
+	if (ui.bound == s) ui_unbind();
+	glDeleteFramebuffers(1, &t->fbo);
+	glDeleteTextures(1, &t->tex);
+	t->magic = 0;
+	free(t);
+	s->userdata = NULL;
+	SDL_FreeSurface(s);
+}
+
+unsigned PLAT_uiSurfaceTexture(SDL_Surface* s) {
+	UI_Target* t = ui_target(s);
+	return t ? t->tex : 0;
+}
+
+void PLAT_uiClear(SDL_Surface* s) {
+	if (!ui_bind(s)) return;
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+// GLES2 has no GL_UNPACK_ROW_LENGTH: rows have to be packed, or padded
+// exactly as far as the alignment says. 0 if neither.
+static int ui_alignment(int pitch, int row_bytes) {
+	if (pitch == ((row_bytes + 3) & ~3)) return 4;
+	if (pitch == row_bytes) return 1;
+	return 0;
+}
+
+unsigned PLAT_uiTexture(SDL_Surface* s) {
+	if (!s || s->w <= 0 || s->h <= 0) return 0;
+	Uint32 format = s->format->format;
+
+	// opaque formats go up as they are
+	if (format == SDL_PIXELFORMAT_RGB565 || format == SDL_PIXELFORMAT_RGB24) {
+		int bpp = format == SDL_PIXELFORMAT_RGB565 ? 2 : 3;
+		int align = ui_alignment(s->pitch, s->w * bpp);
+		if (align) {
+			SDL_LockSurface(s);
+			GLuint tex = ui_texture(GL_RGB, bpp == 2 ? GL_UNSIGNED_SHORT_5_6_5 : GL_UNSIGNED_BYTE, align, s->w, s->h, s->pixels);
+			SDL_UnlockSurface(s);
+			return tex;
+		}
+	}
+
+	// everything else as premultiplied RGBA (R,G,B,A in memory)
+	SDL_Surface* rgba = format == SDL_PIXELFORMAT_ABGR8888 ? s : SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0);
+	if (!rgba) return 0;
+	uint8_t* px = malloc((size_t)rgba->w * rgba->h * 4);
+	GLuint tex = 0;
+	if (px) {
+		SDL_LockSurface(rgba);
+		for (int y = 0; y < rgba->h; y++) {
+			const uint8_t* src = (const uint8_t*)rgba->pixels + (size_t)y * rgba->pitch;
+			uint8_t* dst = px + (size_t)y * rgba->w * 4;
+			for (int x = 0; x < rgba->w; x++, src += 4, dst += 4) {
+				unsigned a = src[3];
+				if (a == 255) {
+					memcpy(dst, src, 4);
+				}
+				else {
+					for (int c = 0; c < 3; c++) {
+						unsigned v = src[c] * a + 128;
+						dst[c] = (v + (v >> 8)) >> 8; // /255, rounded
+					}
+					dst[3] = a;
+				}
+			}
+		}
+		SDL_UnlockSurface(rgba);
+		tex = ui_texture(GL_RGBA, GL_UNSIGNED_BYTE, 4, rgba->w, rgba->h, px);
+		free(px);
+	}
+	if (rgba != s) SDL_FreeSurface(rgba);
+	return tex;
+}
+
+unsigned PLAT_uiAlphaTexture(const void* alpha, int w, int h) {
+	return ui_texture(GL_ALPHA, GL_UNSIGNED_BYTE, 1, w, h, alpha);
+}
+
+void PLAT_uiFreeTexture(unsigned tex) {
+	if (!tex) return;
+	GLuint t = tex;
+	glDeleteTextures(1, &t);
+}
+
+void PLAT_uiDraw(SDL_Surface* dst, unsigned tex, int tex_w, int tex_h, int alpha_only,
+                 const SDL_Rect* src_rect, const SDL_Rect* dst_rect, SDL_Color tint, int opacity) {
+	if (!tex || opacity <= 0) return;
+	int x = dst_rect ? dst_rect->x : 0;
+	int y = dst_rect ? dst_rect->y : 0;
+	int sx = 0, sy = 0, sw = tex_w, sh = tex_h;
+	if (src_rect) {
+		sx = src_rect->x; sy = src_rect->y; sw = src_rect->w; sh = src_rect->h;
+	}
+	int dw, dh;
+	if (dst_rect && dst_rect->w > 0 && dst_rect->h > 0) { // scaled to fit
+		dw = dst_rect->w;
+		dh = dst_rect->h;
+	}
+	else {
+		// 1:1, the source clipped to the texture the way SDL_BlitSurface
+		// does it, moving the destination with it
+		if (sx < 0) { x -= sx; sw += sx; sx = 0; }
+		if (sy < 0) { y -= sy; sh += sy; sy = 0; }
+		if (sx + sw > tex_w) sw = tex_w - sx;
+		if (sy + sh > tex_h) sh = tex_h - sy;
+		dw = sw;
+		dh = sh;
+	}
+	if (sw <= 0 || sh <= 0) return;
+	ui_quad(dst, alpha_only ? UI_PROG_ALPHA : UI_PROG_RGBA, tex, x, y, dw, dh,
+	        (float)sx / tex_w, (float)sy / tex_h, (float)(sx + sw) / tex_w, (float)(sy + sh) / tex_h,
+	        tint, opacity > 255 ? 255 : opacity);
+}
+
+// The bezel is an image with straight (not premultiplied) alpha, so it gets
+// the blend that matches for its one quad.
+void PLAT_uiDrawGameOverlay(SDL_Surface* dst) {
+	if (!dst || !ovl_game.enabled || !ovl_game.tex) return;
+	if (!ui_bind(dst)) return;
+	glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	ui_quad(dst, UI_PROG_RGBA, ovl_game.tex, 0, 0, dst->w, dst->h, 0, 0, 1, 1, (SDL_Color){255, 255, 255}, 255);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+void PLAT_uiFill(SDL_Surface* dst, const SDL_Rect* rect, SDL_Color color, int opacity) {
+	if (!dst || opacity <= 0) return;
+	SDL_Rect r = rect ? *rect : (SDL_Rect){0, 0, dst->w, dst->h};
+	if (r.w <= 0 || r.h <= 0) return;
+	ui_quad(dst, UI_PROG_FILL, 0, r.x, r.y, r.w, r.h, 0, 0, 0, 0, color, opacity > 255 ? 255 : opacity);
+}
+
+// -------------------------------------------------------------------------
 // Video Initialization & Cleanup
 // -------------------------------------------------------------------------
 
@@ -277,12 +690,22 @@ SDL_Surface* PLAT_initVideo(void) {
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 
-	// Setup framebuffer attributes
-	SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 4);
-	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+	// Setup framebuffer attributes. Nothing here ever reads the window's depth,
+	// stencil or alpha, so by default ask for none and the lowest colour
+	// depth: the driver hands out the cheapest config that satisfies it (it
+	// used to give out 8888 with D24S8 for the old 4444/D16 request).
+	// --32bits/--gl ask for the full 8888 + D24S8 config. The launcher and its
+	// tools, where the ui is the whole picture, ask for 888 colour so the
+	// RGBA8 ui isn't cut down to 565 on the way out, but still no depth or
+	// stencil.
+	int full = video_flags & PLAT_VIDEO_32BIT;
+	int rgb888 = full || (video_flags & PLAT_VIDEO_RGB888);
+	SDL_GL_SetAttribute(SDL_GL_RED_SIZE,     rgb888 ? 8 : 5);
+	SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE,   rgb888 ? 8 : 6);
+	SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE,    rgb888 ? 8 : 5);
+	SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE,   full ? 8 : 0);
+	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,   full ? 24 : 0);
+	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, full ? 8 : 0);
 
 	printf("Creating window...\n");
 	vid.window = SDL_CreateWindow("MiaUI", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, FIXED_WIDTH, FIXED_HEIGHT, SDL_WINDOW_OPENGL);
@@ -291,19 +714,47 @@ SDL_Surface* PLAT_initVideo(void) {
 	vid.context = SDL_GL_CreateContext(vid.window);
 	
 	// Debug info
-	int r, g, b, a, depth;
+	int r, g, b, a, depth, stencil;
 	SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &r);
 	SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &g);
 	SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &b);
 	SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &a);
 	SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &depth);
-	printf("GPU Backbuffer format: %d%d%d/%d Depth: %dbits\n", r, g, b, a, depth);
+	SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &stencil);
+	printf("GPU Backbuffer format: %d%d%d/%d Depth: %dbits Stencil: %dbits (video flags %d)\n",
+	       r, g, b, a, depth, stencil, video_flags);
 	printGLString("Version", GL_VERSION);
 	printGLString("Vendor", GL_VENDOR);
 	printGLString("Renderer", GL_RENDERER);
 
+#if PROFILE
+	// into the profile log too, since printf goes nowhere adb can read
+	{
+		GLint max_tex = 0, max_vp[2] = {0,0}, units = 0;
+		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+		glGetIntegerv(GL_MAX_VIEWPORT_DIMS, max_vp);
+		glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+		PROF_LOG("\n=== GL capabilities ===\n");
+		PROF_LOG("vendor      : %s\n", (const char*)glGetString(GL_VENDOR));
+		PROF_LOG("renderer    : %s\n", (const char*)glGetString(GL_RENDERER));
+		PROF_LOG("version     : %s\n", (const char*)glGetString(GL_VERSION));
+		PROF_LOG("backbuffer  : %d%d%d/%d depth %d\n", r, g, b, a, depth);
+		PROF_LOG("max texture : %d\n", max_tex);
+		PROF_LOG("max viewport: %dx%d\n", max_vp[0], max_vp[1]);
+		PROF_LOG("tex units   : %d\n", units);
+		PROF_LOG("extensions  : %s\n\n", (const char*)glGetString(GL_EXTENSIONS));
+	}
+#endif
+
+	if (video_flags & PLAT_VIDEO_32BIT) {
+		const char* exts = (const char*)glGetString(GL_EXTENSIONS);
+		gles_has_bgra = exts && (strstr(exts, "GL_EXT_texture_format_BGRA8888") ||
+		                         strstr(exts, "GL_IMG_texture_format_BGRA8888"));
+		printf("32-bit (XRGB8888) core output: %s\n",
+		       gles_has_bgra ? "supported (native BGRA upload)" : "UNSUPPORTED (no BGRA extension)");
+	}
+
 	SDL_GL_SetSwapInterval(1); // Enable VSync
-	vid.swap_interval = 1;
 
 	printf("Compiling shaders...\n");
 	GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_shader_source);
@@ -342,45 +793,21 @@ SDL_Surface* PLAT_initVideo(void) {
 	glEnableVertexAttribArray(0);
 	glEnableVertexAttribArray(1);
 
-	// Allocate CPU side buffer for the UI surface (double buffered pages)
-	vid.width = FIXED_WIDTH;
-	vid.height = FIXED_HEIGHT;
-	vid.pitch = FIXED_PITCH;
-	printf("Allocating pixels (PAGE_SIZE=%d, PAGE_COUNT=%d)...\n", PAGE_SIZE, PAGE_COUNT);
-	vid.pixels = malloc(PAGE_SIZE * PAGE_COUNT);
-
-	if (!vid.pixels) {
-		printf("Failed to allocate pixels!\n");
-		return NULL;
-	}
-
-	vid.page = 1;
-
-	printf("Creating RGB surface...\n");
-	// FIXED_DEPTH is 16 (FIXED_BPP=2), so we must use 16-bit masks. Using RGBA4444.
-	vid.screen = SDL_CreateRGBSurfaceFrom(vid.pixels + PAGE_SIZE, vid.width, vid.height, FIXED_DEPTH, vid.pitch, MASK_RGBA4444);
-
+	// The ui layer: a render target the size of the panel (HDMI is the same
+	// size on this device), composited 1:1
+	vid.screen = ui_init() ? PLAT_uiCreateSurface(FIXED_WIDTH, FIXED_HEIGHT) : NULL;
 	if (!vid.screen) {
-		printf("Failed to create RGB surface: %s\n", SDL_GetError());
+		fprintf(stderr, "PLAT_initVideo: the GPU can't draw the ui\n");
 		return NULL;
 	}
-
-	printf("Generating textures...\n");
-	// Screen (UI) Texture
-	glGenTextures(1, &vid.screen_tex);
-	glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vid.width, vid.height, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, NULL);
-
-	// Pre-build screen quad VBO (0,0,640,480) — only changes on resizeVideo
+	vid.screen_tex = PLAT_uiSurfaceTexture(vid.screen);
+	printf("ui: drawn by the GPU (%ix%i RGBA8)\n", vid.screen->w, vid.screen->h);
 	upload_quad_vbo(vid.vbo_screen, 0, 0, FIXED_WIDTH, FIXED_HEIGHT);
 
 	// Game Texture
 	glGenTextures(1, &vid.game_tex);
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
+	vid.game_filter = GL_NEAREST;
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -396,6 +823,9 @@ SDL_Surface* PLAT_initVideo(void) {
 	gles_blit.last_sw = 0;
 	gles_blit.last_sh = 0;
 	gles_blit.last_stride_w = 0;
+	gles_blit.gl_format = GL_RGB;
+	gles_blit.gl_type = GL_UNSIGNED_SHORT_5_6_5;
+	gles_blit.align = 1;
 
 	// Global GL state
 	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
@@ -410,10 +840,19 @@ SDL_Surface* PLAT_initVideo(void) {
 	return vid.screen;
 }
 
+static int ui_layer_visible = 1; // see PLAT_setUILayer in api.h
+static int swap_interval = 1; // what the driver is set to right now (PLAT_initVideo sets 1)
+
+// Redraws the last picture with every layer as it was, at falling (or
+// rising) brightness: nothing is uploaded, the textures still hold it all.
+// One step per vsync, so it is smooth and takes the same ~200ms anywhere.
 void PLAT_fadeVideo(int type) { // 0 = fade out (a negro), 1 = fade in
 	float start = (type == 0) ? 1.0f : 0.0f;
 	float end   = (type == 0) ? 0.0f : 1.0f;
-	int steps = 20; // Número de frames para el fade (aprox 300ms a 60fps)
+	int steps = 12;
+	ui_unbind(); // whatever the ui drew is in its textures already
+	SDL_GL_SetSwapInterval(1);
+	swap_interval = 1;
 	
 	for (int i = 0; i <= steps; i++) {
 		// Calcular brillo actual (interpolación lineal)
@@ -427,31 +866,30 @@ void PLAT_fadeVideo(int type) { // 0 = fade out (a negro), 1 = fade in
 
 		// 3. REDIBUJAR LA ÚLTIMA ESCENA (Sin subir texturas nuevas)
 		
-		// A) Dibujar juego
-		if (vid.game_tex) {
+		// A) Dibujar juego, if a frame ever went into it (minui has none)
+		glDisable(GL_BLEND);
+		if (gles_blit.last_stride_w) {
 			 draw_cached_quad(vid.vbo_game, vid.game_tex);
 		}
 
 		// B) Dibujar Overlay de juego
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		if(ovl_game.enabled && ovl_game.tex) {
 			draw_cached_quad(vid.vbo_game_overlay, ovl_game.tex);
 		}
 
-		// C) Dibujar Overlay UI (pantalla principal), only if the last flip showed it
-		if (vid.screen_tex && vid.ui_drawn) {
-			draw_cached_quad(vid.vbo_screen, vid.screen_tex);
-		}
+		// C) Dibujar Overlay UI (pantalla principal), premultiplied
+		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		if (ui_layer_visible) draw_cached_quad(vid.vbo_screen, vid.screen_tex);
 
 		// D) Dibujar Pill Overlay
-		if (ovl.enabled && ovl.tex) {
-			draw_cached_quad(vid.vbo_overlay, ovl.tex);
+		if (ovl.enabled && ovl.surface) {
+			draw_cached_quad(vid.vbo_overlay, PLAT_uiSurfaceTexture(ovl.surface));
 		}
 
-		// 4. Mostrar frame
+		// 4. Mostrar frame (waits for the vsync: that is the pacing)
 		SDL_GL_SwapWindow(vid.window);
-		
-		// Pequeña pausa para que el fade sea visible (10ms)
-		usleep(5000);
 	}
 	
 	// Asegurarse de dejar el brillo en el estado final
@@ -459,22 +897,28 @@ void PLAT_fadeVideo(int type) { // 0 = fade out (a negro), 1 = fade in
 }
 
 void PLAT_quitVideo(void) {
-	set_swap_interval(0);
 	PLAT_fadeVideo(0);
 
-	// Clear to black
+	// Black into every buffer the driver scans out from (it rotates three),
+	// so none of them still holds an old frame to flash when the next
+	// process takes the display
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
-	SDL_GL_SwapWindow(vid.window);
-	glClear(GL_COLOR_BUFFER_BIT);
-	SDL_GL_SwapWindow(vid.window);
+	for (int i = 0; i < 3; i++) {
+		glClear(GL_COLOR_BUFFER_BIT);
+		SDL_GL_SwapWindow(vid.window);
+	}
+	SDL_GL_SetSwapInterval(0);
 
 	if(ovl_game.enabled == 1) {
 		PLAT_quitGameOverlay();
 	}
 
+	PLAT_quitToast();
+	PLAT_uiFreeSurface(vid.screen);
+	vid.screen = NULL;
+	vid.screen_tex = 0;
+	ui_quit();
 	glDeleteTextures(1, &vid.game_tex);
-	glDeleteTextures(1, &vid.screen_tex);
 	glDeleteBuffers(1, &vid.vbo_screen);
 	glDeleteBuffers(1, &vid.vbo_game);
 	glDeleteBuffers(1, &vid.vbo_overlay);
@@ -485,94 +929,66 @@ void PLAT_quitVideo(void) {
 	SDL_GL_DeleteContext(vid.context);
 	SDL_DestroyWindow(vid.window);
 
-	SDL_FreeSurface(vid.screen);
-	free(vid.pixels);
 	SDL_Quit();
 
 	system("cat /dev/zero > /dev/fb0 2>/dev/null");
 }
 
 void PLAT_clearVideo(SDL_Surface* screen) {
-	memset(screen->pixels, 0, vid.pitch * vid.height);
+	PLAT_uiClear(screen); // to transparent: the game, or black, shows through
 }
+// see PLAT_setUILayer in api.h
+void PLAT_setUILayer(int visible) { ui_layer_visible = visible; }
+
+// The achievement toast, a render target of its own (drawn by the caller,
+// see PLAT_loadToast in api.h), so showing one doesn't mean compositing the
+// whole 640x480 ui layer every frame in game. The slide-in only moves the
+// quad.
+static struct {
+	SDL_Surface* image; // owned from PLAT_loadToast on
+	GLuint vbo;
+	int x, y;   // where the vbo currently puts it
+	int visible;
+} toast;
+
+void PLAT_loadToast(SDL_Surface* image) {
+	if (toast.image && toast.image!=image) PLAT_uiFreeSurface(toast.image);
+	toast.image = image;
+	toast.visible = 0;
+	toast.x = toast.y = -1; // force the vbo to be built for the new size
+	if (image && !toast.vbo) glGenBuffers(1, &toast.vbo);
+}
+
+static void PLAT_quitToast(void) {
+	PLAT_uiFreeSurface(toast.image);
+	if (toast.vbo) glDeleteBuffers(1, &toast.vbo);
+	memset(&toast, 0, sizeof(toast));
+}
+
+void PLAT_showToast(int visible, int x, int y) {
+	toast.visible = visible && toast.image;
+	if (!toast.visible || (x==toast.x && y==toast.y)) return;
+	upload_quad_vbo(toast.vbo, x, y, toast.image->w, toast.image->h);
+	toast.x = x;
+	toast.y = y;
+}
+
 void PLAT_clearAll(void) {
 	PLAT_clearVideo(vid.screen);
-	vid.cleared = 1;
 }
 
 void PLAT_setVsync(int vsync) {
-	set_swap_interval(vsync ? 1 : 0);
+	swap_interval = vsync ? 1 : 0;
+	SDL_GL_SetSwapInterval(swap_interval);
 }
 
-void PLAT_setUIInGame(int enabled) {
-	vid.ui_in_game = enabled;
-}
-
-// -------------------------------------------------------------------------
-// Perf counters (integer only, see PLAT_perfReport)
-// -------------------------------------------------------------------------
-
-#include <time.h>
-static uint64_t perf_us(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000;
-}
-static struct {
-	uint64_t start, last_flip;
-	uint32_t flips, game_frames;
-	uint64_t emu_us, upload_us, ui_us, swap_us; // emu = time from end of last flip to this flip
-	uint32_t worst_frame_us, slow_frames;      // slow = interval > 17.5 ms
-	uint32_t vsync_frames;                      // flips done with swap interval 1
-	uint32_t audio_wait_ms;                     // part of emu spent sleeping on a full audio buffer
-} perf;
-
-void PLAT_perfAudioWait(uint32_t ms) {
-	perf.audio_wait_ms += ms;
-}
-
-void PLAT_perfReport(int vsync_mode) {
-	uint64_t now = perf_us();
-	if (perf.start && perf.flips) {
-		uint32_t span = (uint32_t)(now - perf.start);
-		uint32_t n = perf.flips;
-		printf("PERF mode=%d fps_x10=%u game=%u slow=%u worst_ms=%u vsync_on=%u | avg_us emu=%u (audio_wait=%u) upload=%u ui=%u swap=%u\n",
-			vsync_mode, (uint32_t)((uint64_t)n * 10000000u / span), perf.game_frames, perf.slow_frames,
-			perf.worst_frame_us / 1000, perf.vsync_frames,
-			(uint32_t)(perf.emu_us / n), perf.audio_wait_ms * 1000u / n,
-			(uint32_t)(perf.upload_us / n), (uint32_t)(perf.ui_us / n), (uint32_t)(perf.swap_us / n));
-		fflush(stdout);
-	}
-	uint64_t keep = perf.last_flip;
-	memset(&perf, 0, sizeof(perf));
-	perf.start = now;
-	perf.last_flip = keep;
+void PLAT_repeatFrame(void) {
+	gles_blit.repeat = 1;
 }
 
 // -------------------------------------------------------------------------
-// Video Resize & Scaling
+// Video Scaling
 // -------------------------------------------------------------------------
-
-/**
- * Resizes the UI surface (not necessarily the window).
- * This is used when the application requests a different resolution for drawing.
- */
-SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch) {
-	LOG_info("resizeVideo: %ix%i pitch: %i\n", w,h, pitch);
-
-	vid.width = w;
-	vid.height = h;
-	vid.pitch = pitch;
-
-	SDL_FreeSurface(vid.screen);
-	// Re-wrap the pixels buffer with new dimensions
-	vid.screen = SDL_CreateRGBSurfaceFrom(vid.pixels + vid.page * PAGE_SIZE, vid.width, vid.height, FIXED_DEPTH, vid.pitch, MASK_RGBA4444);
-
-	glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vid.width, vid.height, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, NULL);
-
-	return vid.screen;
-}
 
 void PLAT_setVideoScaleClip(int x, int y, int width, int height) {
 	vid.clip_x = x;
@@ -585,13 +1001,10 @@ void PLAT_setNearestNeighbor(int enabled) {
 	vid.nearest = enabled;
 	GLint filter = enabled ? GL_NEAREST : GL_LINEAR;
 	
-	glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	vid.game_filter = filter;
 
 	printf("setNearestNeighbor: %i\n", enabled);
 }
@@ -602,19 +1015,12 @@ void PLAT_setSharpness(int sharpness) {
 	glBindTexture(GL_TEXTURE_2D, vid.game_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+	vid.game_filter = filter;
 
 	printf("setSharpness: %i\n", sharpness);
 }
 
 void PLAT_setEffect(int _effect) {
-}
-
-void PLAT_vsync(int _remaining) {
-	// handled by SDL_GL_SwapWindow in PLAT_flip
-}
-
-void PLAT_clearLayers(int layer) {
-	PLAT_clearVideo(vid.screen);
 }
 
 // -------------------------------------------------------------------------
@@ -651,8 +1057,64 @@ GLES_SCALER(4)
 GLES_SCALER(5)
 GLES_SCALER(6)
 
+// XRGB8888 cores (--32bits). The scale factor means nothing to the GPU
+// upload, so one wrapper does for all of them.
+static void scale_n32(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh, uint32_t dp) {
+	scale_gles(src, dst, sw, sh, sp, dw, dh, dp, 4);
+}
+
+// A hardware frame's "scaler": nothing to upload, the FBO's texture already
+// is the picture. It goes in the game texture's place and the flip draws it
+// like a repeated frame. Only the VBO changes, and only with the geometry.
+static void scale_hw(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dw, uint32_t dh, uint32_t dp) {
+	if (hw.dirty) {
+		// The frame is the bottom-left (or top-left) true_w x true_h of the
+		// FBO, cropped like a software one would be.
+		GFX_Renderer* r = hw.renderer;
+		float tw = hw.w;
+		float th = hw.h;
+		float v_top, v_bottom;
+		if (hw.bottom_left) {
+			v_top    = (r->true_h - r->src_y) / th;
+			v_bottom = (r->true_h - r->src_y - r->src_h) / th;
+		}
+		else {
+			v_top    = r->src_y / th;
+			v_bottom = (r->src_y + r->src_h) / th;
+		}
+		PROF_COUNT(PROF_VBO_REBUILDS, 1);
+		upload_quad_vbo_rect(vid.vbo_game, r->dst_x, r->dst_y, r->dst_w, r->dst_h,
+		                     r->src_x / tw, v_top, (r->src_x + r->src_w) / tw, v_bottom);
+		hw.dirty = 0;
+	}
+	gles_blit.src = NULL;
+	gles_blit.repeat = 1;           // draw the game texture as it is
+	gles_blit.last_stride_w = hw.w; // which needs this to be non-zero
+}
+
 // Returns the appropriate scaler function (which just sets up state for GL upload)
 scaler_t PLAT_getScaler(GFX_Renderer* renderer) {
+	if (hw.presenting) {
+		hw.renderer = renderer;
+		hw.dirty = 1;
+		return scale_hw;
+	}
+
+	// The upload format follows the source's pixel size. Settled here, which
+	// only runs when the geometry changes, so the per-frame upload in
+	// PLAT_flip has nothing to decide.
+	int is32 = renderer->src_bpp==4 && gles_has_bgra;
+	GLenum format = is32 ? GL_BGRA_EXT : GL_RGB;
+	if (format != gles_blit.gl_format) {
+		gles_blit.gl_format = format;
+		gles_blit.gl_type   = is32 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_SHORT_5_6_5;
+		// 1 is right for every 16-bit source (see the table in PLAT_flip);
+		// 4 is exact for a 4-byte format
+		gles_blit.align     = is32 ? 4 : 1;
+		gles_blit.last_stride_w = 0; // the texture has to be reallocated in the new format
+	}
+	if (is32) return scale_n32;
+
 	switch (renderer->scale) {
 		case 6:  return scale6x6_n16;
 		case 5:  return scale5x5_n16;
@@ -680,20 +1142,15 @@ void PLAT_blitRenderer(GFX_Renderer* renderer) {
 // -------------------------------------------------------------------------
 
 void PLAT_flip(SDL_Surface* IGNORED, int sync) {
-	// GFX_flip passes 0 when a Lenient frame is over budget: don't wait for vsync then
-	set_swap_interval(sync ? 1 : 0);
-
-	// During gameplay the UI layer is empty unless the debug HUD is on: skip its
-	// 640x480 upload (CPU-side on this driver) and the blended full-screen quad
-	int draw_ui = !gles_blit.src || vid.ui_in_game;
-
-	uint64_t t0 = perf_us(), t1, t2, t3;
-	if (perf.last_flip) {
-		uint32_t interval = (uint32_t)(t0 - perf.last_flip);
-		perf.emu_us += interval;
+	// sync=0 on a frame that GFX_flip found already late: present it without
+	// waiting. Switching costs 7us on this driver and applies to this very
+	// swap; the next on-time frame switches back.
+	if ((sync ? 1 : 0) != swap_interval) {
+		swap_interval = sync ? 1 : 0;
+		SDL_GL_SetSwapInterval(swap_interval);
 	}
-	if (gles_blit.src) perf.game_frames++;
-	if (sync) perf.vsync_frames++;
+
+	ui_unbind(); // the ui is drawn: back to the window
 
 	glClear(GL_COLOR_BUFFER_BIT);
 
@@ -714,6 +1171,7 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 		// Rebuild game VBO only when geometry changed
 		// Ahora pasamos u_max para recortar la "basura" del padding a la derecha
 		if (gles_blit.dirty) {
+			PROF_COUNT(PROF_VBO_REBUILDS, 1);
 			upload_quad_vbo_uv(vid.vbo_game, 
 							   (float)gles_blit.dx, (float)gles_blit.dy, 
 							   (float)gles_blit.dw, (float)gles_blit.dh,
@@ -723,28 +1181,43 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 
 		// Upload game texture pixels DIRECTAMENTE (Sin memcpy)
 		glBindTexture(GL_TEXTURE_2D, vid.game_tex);
-		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		// RGB565 at 1, or XRGB8888 as BGRA_EXT at 4 (B,G,R,X in memory, taken
+		// as-is: no swizzle, no second shader program) - see PLAT_getScaler
+		glPixelStorei(GL_UNPACK_ALIGNMENT, gles_blit.align);
 
 		// Verificamos si las dimensiones DE MEMORIA (stride) han cambiado, no solo las visibles
+		PROF_BEGIN(PROF_TEX_GAME);
+		PROF_COUNT(PROF_TEX_BYTES, (uint64_t)stride_w * gles_blit.sh * gles_blit.bpp);
 		if (gles_blit.last_stride_w == stride_w && gles_blit.last_sh == gles_blit.sh) {
 			// Dimensions unchanged: cheaper sub-image update
 			// Usamos stride_w como el ancho de la textura
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_w, gles_blit.sh, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, gles_blit.src);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stride_w, gles_blit.sh, gles_blit.gl_format, gles_blit.gl_type, gles_blit.src);
 		} else {
-			// Dimensions changed: reallocate texture
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, stride_w, gles_blit.sh, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, gles_blit.src);
+			// Dimensions or format changed: reallocate texture
+			glTexImage2D(GL_TEXTURE_2D, 0, gles_blit.gl_format, stride_w, gles_blit.sh, 0, gles_blit.gl_format, gles_blit.gl_type, gles_blit.src);
 			
 			gles_blit.last_sw = gles_blit.sw; // Mantenemos esto por referencia
 			gles_blit.last_stride_w = stride_w; // Actualizamos el stride trackeado
 			gles_blit.last_sh = gles_blit.sh;
 		}
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		PROF_END(PROF_TEX_GAME);
 
 		// Draw game quad (cached VBO)
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_game, vid.game_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 		gles_blit.src = NULL;
 	}
-	t1 = perf_us();
+	else if (gles_blit.repeat && gles_blit.last_stride_w) {
+		// no new picture from the core: the texture still holds the last one
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(vid.vbo_game, vid.game_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
+	}
+	gles_blit.repeat = 0;
 
 	// enable blending for ui/overlays
 	glEnable(GL_BLEND);
@@ -752,76 +1225,309 @@ void PLAT_flip(SDL_Surface* IGNORED, int sync) {
 
 	// 2. Draw Game Overlay (e.g. bezels)
 	if(ovl_game.enabled && ovl_game.surface) {
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_game_overlay, ovl_game.tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 	}
 
-	// 3. Draw Screen Overlay (UI) — cached VBO, only pixels change
-	if (draw_ui) {
-		glBindTexture(GL_TEXTURE_2D, vid.screen_tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.width, vid.height, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, vid.screen->pixels);
+	// The ui layers are render targets the GPU has already drawn, so there is
+	// nothing to upload, and premultiplied (see "UI, drawn by the GPU").
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+	// 3. Draw Screen Overlay (UI)
+	// Skipping it while the caller says it is empty saves the composite of a
+	// full-screen texture on every frame in game.
+	if (ui_layer_visible) {
+		PROF_BEGIN(PROF_DRAW);
 		draw_cached_quad(vid.vbo_screen, vid.screen_tex);
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 	}
-	vid.ui_drawn = draw_ui;
+
+	// 3b. Achievement toast, over the ui layer like it used to be drawn in it
+	if (toast.visible) {
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(toast.vbo, PLAT_uiSurfaceTexture(toast.image));
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
+	}
 
 	// 4. Draw Pill Overlay (Battery/Volume popup) if enabled
 	if (ovl.enabled && ovl.surface) {
-		glBindTexture(GL_TEXTURE_2D, ovl.tex);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ovl.surface->w, ovl.surface->h, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, ovl.surface->pixels);
-		draw_cached_quad(vid.vbo_overlay, ovl.tex);
+		PROF_BEGIN(PROF_DRAW);
+		draw_cached_quad(vid.vbo_overlay, PLAT_uiSurfaceTexture(ovl.surface));
+		PROF_END(PROF_DRAW);
+		PROF_COUNT(PROF_DRAWS, 1);
 	}
 
-	t2 = perf_us();
+#if PROFILE && PROFILE_GLFINISH
+	// serialises cpu and gpu: attributes gpu cost, destroys pipelining
+	PROF_BEGIN(PROF_GPU_FINISH);
+	glFinish();
+	PROF_END(PROF_GPU_FINISH);
+#endif
+
+	PROF_BEGIN(PROF_SWAP);
 	#ifndef PROFILE_GPU
 	SDL_GL_SwapWindow(vid.window);
 	#else
 	PLAT_checkGPULoad();
 	#endif
-	t3 = perf_us();
+	PROF_END(PROF_SWAP);
+	PROF_PRESENT();
+}
 
-	// full frame = from the end of the previous flip to the end of this one
-	if (perf.last_flip) {
-		uint32_t frame = (uint32_t)(t3 - perf.last_flip);
-		if (frame > perf.worst_frame_us) perf.worst_frame_us = frame;
-		if (frame > 17500) perf.slow_frames++;
+// -------------------------------------------------------------------------
+// Hardware Rendering (--gl)
+// -------------------------------------------------------------------------
+//
+// The core gets an FBO in this same context, the way RetroArch's gl driver
+// does it on this device: a second shared context measured 1.2ms a frame
+// more (3.27 vs 4.45ms) for nothing, since the frontend and the core never
+// run at the same time. The price is putting the frontend's state back after
+// the core has run, ~25 calls, measured at 2.6us.
+//
+// Nothing here runs, or even exists on the GPU, unless a core launched with
+// --gl asks for it: no FBO, no extra texture, no extra state work.
+
+static void set_filter(GLuint tex, GLint filter) {
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+}
+
+unsigned PLAT_hwInit(int width, int height, int depth, int stencil, int bottom_left) {
+	const char* exts = (const char*)glGetString(GL_EXTENSIONS);
+	if (!exts) exts = "";
+
+	GLint max_tex = 0, max_rb = 0;
+	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+	glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+	if (width<=0 || height<=0) {
+		width = FIXED_WIDTH;
+		height = FIXED_HEIGHT;
 	}
-	perf.upload_us += t1 - t0;
-	perf.ui_us += t2 - t1;
-	perf.swap_us += t3 - t2;
-	perf.flips++;
-	perf.last_flip = t3;
+	// non-power-of-two is fine here, so exactly what the core says it needs
+	hw.w = MIN(width,  MIN(max_tex, max_rb));
+	hw.h = MIN(height, MIN(max_tex, max_rb));
 
-	// Swap pages for double buffering of the UI surface
-	vid.page ^= 1;
-	vid.screen->pixels = vid.pixels + vid.page * PAGE_SIZE;
+	glGenTextures(1, &hw.tex);
+	glBindTexture(GL_TEXTURE_2D, hw.tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, vid.game_filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, vid.game_filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	// RGBA8 rather than 565: cores can rely on destination alpha
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, hw.w, hw.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
-	if (vid.cleared) {
-		PLAT_clearVideo(vid.screen);
-		vid.cleared = 0;
+	// GLES2 has no GL_DEPTH_STENCIL_ATTACHMENT: one packed D24S8 buffer goes
+	// to both attachment points. Depth alone gets 24 bits too, for the sake of
+	// 3D cores' z-fighting; every combination was checked complete here.
+	int packed = strstr(exts, "GL_OES_packed_depth_stencil") != NULL;
+	int depth24 = strstr(exts, "GL_OES_depth24") != NULL;
+	if (stencil && !packed) {
+		printf("hw: no packed depth/stencil, the core gets no stencil\n");
+		stencil = 0;
+		depth = 1;
 	}
+	GLenum depth_format = 0;
+	if (stencil) depth_format = GL_DEPTH24_STENCIL8_OES;
+	else if (depth) depth_format = depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16;
+	if (depth_format) {
+		glGenRenderbuffers(1, &hw.depth);
+		glBindRenderbuffer(GL_RENDERBUFFER, hw.depth);
+		glRenderbufferStorage(GL_RENDERBUFFER, depth_format, hw.w, hw.h);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+
+	glGenFramebuffers(1, &hw.fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, hw.fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hw.tex, 0);
+	if (hw.depth) glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
+	if (stencil)  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, hw.depth);
+
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status!=GL_FRAMEBUFFER_COMPLETE) {
+		printf("hw: %ix%i framebuffer incomplete (0x%x)\n", hw.w, hw.h, status);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glDeleteFramebuffers(1, &hw.fbo);
+		if (hw.depth) glDeleteRenderbuffers(1, &hw.depth);
+		glDeleteTextures(1, &hw.tex);
+		memset(&hw, 0, sizeof(hw));
+		return 0;
+	}
+
+	// so a repeat before the core's first frame shows black, not garbage
+	glViewport(0, 0, hw.w, hw.h);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &hw.max_attribs);
+	// eglGetProcAddress only resolves extensions on this driver, which is
+	// what this is; SDL's falls back to the library for core functions too
+	if (strstr(exts, "GL_OES_vertex_array_object"))
+		hw.bind_vao = (PFNGLBINDVERTEXARRAYOESPROC)SDL_GL_GetProcAddress("glBindVertexArrayOES");
+
+	hw.bottom_left = bottom_left;
+	hw.sw_tex = vid.game_tex;
+	PLAT_hwPresent(1);
+	PLAT_hwRestoreState();
+
+	printf("hw: fbo %u %ix%i RGBA8 + %s, %i vertex attribs, vao %s\n", hw.fbo, hw.w, hw.h,
+	       depth_format==GL_DEPTH24_STENCIL8_OES ? "D24S8" :
+	       depth_format==GL_DEPTH_COMPONENT24_OES ? "D24" :
+	       depth_format ? "D16" : "no depth",
+	       hw.max_attribs, hw.bind_vao ? "yes" : "no");
+	return hw.fbo;
+}
+
+void PLAT_hwQuit(void) {
+	if (!hw.fbo) return;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glDeleteFramebuffers(1, &hw.fbo);
+	if (hw.depth) glDeleteRenderbuffers(1, &hw.depth);
+	// The one that is the game layer stays it, so the fade out on quit still
+	// has the last frame; PLAT_quitVideo deletes it with the rest.
+	if (vid.game_tex==hw.tex) glDeleteTextures(1, &hw.sw_tex);
+	else glDeleteTextures(1, &hw.tex);
+	memset(&hw, 0, sizeof(hw));
+}
+
+// Everything the compositor relies on, from PLAT_initVideo and PLAT_flip.
+// The libretro contract lets the frontend change any of it between frames,
+// so cores have to cope with the reverse; glsm-based ones rebind it all.
+void PLAT_hwRestoreState(void) {
+	// first: with a core's VAO bound, the buffer and attrib calls below would
+	// rewrite that VAO rather than restore ours
+	if (hw.bind_vao) hw.bind_vao(0);
+	// the next ui draw binds its target and state again from scratch
+	ui.bound = NULL;
+	ui.current = 0;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
+	glUseProgram(vid.program);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, vid.ibo);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	// an array left enabled would be read by our draws too, possibly from a
+	// client pointer that's long gone
+	for (int i=2; i<hw.max_attribs; i++) glDisableVertexAttribArray(i);
+	glActiveTexture(GL_TEXTURE0);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_STENCIL_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_POLYGON_OFFSET_FILL);
+	glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+	glDisable(GL_SAMPLE_COVERAGE);
+	glEnable(GL_DITHER);
+	glDisable(GL_BLEND);
+	glBlendEquation(GL_FUNC_ADD);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+}
+
+// Which texture is the game layer: the FBO's, or the software one a HW core
+// can still fall back to for a frame. The caller re-selects the scaler.
+void PLAT_hwPresent(int hw_frame) {
+	if (hw_frame==hw.presenting) return;
+	hw.presenting = hw_frame;
+	vid.game_tex = hw_frame ? hw.tex : hw.sw_tex;
+	// the filter may have been changed while the other one was in place
+	set_filter(vid.game_tex, vid.game_filter);
+	gles_blit.dirty = 1;         // the VBO holds the other texture's rect
+	gles_blit.last_stride_w = 0; // and the software texture may never have held this size
+}
+
+// The last hardware frame (true_w x true_h of the FBO) as an RGB565 surface
+// of that same size, for the menu backdrop and the save state thumbnail -
+// both are written against a software frame's pixels.
+//
+// glReadPixels is the slow part on this driver, ~0.55us a pixel whatever
+// the format (RGBA8 is the only one it doesn't make worse), so the frame is
+// shrunk on the GPU first to at most 320x240 by an integer factor, which the
+// linear filter turns into a box average, then read and scaled back up. A
+// 640x480 frame costs ~40ms, once, when the menu opens or a state is saved.
+#define CAPTURE_MAX_PIXELS (320 * 240)
+
+SDL_Surface* PLAT_hwCapture(int w, int h) {
+	if (!hw.fbo || w<=0 || h<=0) return NULL;
+	PLAT_hwRestoreState(); // our program, buffers and attribs, whoever drew last
+	w = MIN(w, hw.w);
+	h = MIN(h, hw.h);
+
+	int d = 1;
+	while ((w / d) * (h / d) > CAPTURE_MAX_PIXELS) d++;
+	int cw = MAX(w / d, 1);
+	int ch = MAX(h / d, 1);
+
+	SDL_Surface* out = SDL_CreateRGBSurface(SDL_SWSURFACE, w, h, 16, MASK_RGB565);
+	uint8_t* px = malloc((size_t)cw * ch * 4);
+	GLuint tex = 0, fbo = 0, vbo = 0;
+	if (!out || !px) goto done;
+
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+		SDL_FreeSurface(out);
+		out = NULL;
+		goto done;
+	}
+
+	// The whole frame over the whole viewport, drawn upside down: glReadPixels
+	// returns the bottom row first, so this way the image comes back top first.
+	float tw = hw.w, th = hw.h;
+	float v_image_top    = hw.bottom_left ? h / th : 0.0f;
+	float v_image_bottom = hw.bottom_left ? 0.0f : h / th;
+	glGenBuffers(1, &vbo);
+	upload_quad_vbo_rect(vbo, 0, 0, FIXED_WIDTH, FIXED_HEIGHT,
+	                     0.0f, v_image_bottom, w / tw, v_image_top);
+	glViewport(0, 0, cw, ch);
+	glDisable(GL_BLEND);
+	set_filter(hw.tex, d>1 ? GL_LINEAR : GL_NEAREST);
+	draw_cached_quad(vbo, hw.tex);
+	set_filter(hw.tex, vid.game_filter);
+
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glReadPixels(0, 0, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+	// back up to the frame's own size, nearest neighbour
+	for (int y=0; y<h; y++) {
+		const uint8_t* src = px + (size_t)(y * ch / h) * cw * 4;
+		uint16_t* dst = (uint16_t*)((uint8_t*)out->pixels + (size_t)y * out->pitch);
+		for (int x=0; x<w; x++) {
+			const uint8_t* p = src + (x * cw / w) * 4;
+			dst[x] = ((p[0] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[2] >> 3);
+		}
+	}
+
+done:
+	if (vbo) glDeleteBuffers(1, &vbo);
+	if (fbo) glDeleteFramebuffers(1, &fbo);
+	if (tex) glDeleteTextures(1, &tex);
+	free(px);
+	PLAT_hwRestoreState();
+	return out;
 }
 
 // -------------------------------------------------------------------------
 // Overlay Initialization
 // -------------------------------------------------------------------------
 
-#define OVERLAY_WIDTH PILL_SIZE 
-#define OVERLAY_HEIGHT PILL_SIZE 
-#define OVERLAY_BPP 2
-#define OVERLAY_DEPTH 16
-#define OVERLAY_PITCH (OVERLAY_WIDTH * OVERLAY_BPP) 
-#define OVERLAY_RGBA_MASK MASK_RGBA4444
-
+// The battery pill, a render target PWR_init draws into once
 SDL_Surface* PLAT_initOverlay(void) {
-	ovl.surface = SDL_CreateRGBSurface(0, SCALE2(OVERLAY_WIDTH, OVERLAY_HEIGHT), OVERLAY_DEPTH, OVERLAY_RGBA_MASK);
-	memset(ovl.surface->pixels, 0, ovl.surface->pitch * ovl.surface->h);
-
-	glGenTextures(1, &ovl.tex);
-	glBindTexture(GL_TEXTURE_2D, ovl.tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ovl.surface->w, ovl.surface->h, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, NULL);
+	ovl.surface = PLAT_uiCreateSurface(SCALE2(PILL_SIZE, PILL_SIZE));
+	if (!ovl.surface) return NULL;
 
 	// Pre-build overlay quad VBO (position is fixed)
 	int ow = ovl.surface->w;
@@ -833,18 +1539,18 @@ SDL_Surface* PLAT_initOverlay(void) {
 	return ovl.surface;
 }
 void PLAT_quitOverlay(void) {
-	if (ovl.surface) {
-		SDL_FreeSurface(ovl.surface);
-		ovl.surface = NULL;
-	}
-	glDeleteTextures(1, &ovl.tex);
+	PLAT_uiFreeSurface(ovl.surface);
+	ovl.surface = NULL;
+	ovl.enabled = 0;
 }
 void PLAT_enableOverlay(int enable) {
 	ovl.enabled = enable;
 }
 
+// 32-bit: a bezel's gradients band visibly at 4 bits a channel (the Game
+// Gear's), and it costs nothing per frame - uploaded once, then only sampled.
 void PLAT_initGameOverlay(const char* ovl_path) {
-	PLAT_initSurfaceOverlay(ovl_path, MODE_444A);
+	PLAT_initSurfaceOverlay(ovl_path, MODE_RGBA);
 }
 
 void PLAT_initSurfaceOverlay(const char* filename, int mode) {
@@ -906,6 +1612,14 @@ void PLAT_initSurfaceOverlay(const char* filename, int mode) {
                 printf(">> loading %s as 4BPP buffer converted to 4444 (16bits alpha channel).\n", filename);
                 break;
             case MODE_RGBA:
+                // bytes R,G,B,A whatever IMG_Load picked (it can be ARGB)
+                converted = SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_ABGR8888, 0);
+                SDL_FreeSurface(surface);
+                if (!converted) {
+                    fprintf(stderr, "Failed to convert surface to RGBA8888: %s\n", SDL_GetError());
+                    return;
+                }
+                surface = converted;
                 format = GL_RGBA;
                 ftype = GL_UNSIGNED_BYTE;
                 printf(">> loading %s as 4BPP buffer as full RGBA.\n", filename);
@@ -979,18 +1693,36 @@ void PLAT_powerOff(void) {
 	system("shutdown");
 }
 
+static void writeSysfs(const char* path, const char* value, int len) {
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	if (write(fd, value, len) != len) LOG_warn("can't write %s: %s\n", path, strerror(errno));
+	close(fd);
+}
+
+// What overclock.elf does, minus the shell: it's a bash script, so every
+// call was sh then bash then four echos, ~10ms each time the menu opened or
+// closed. Its mapping is kept as is, including running "normal" (1296000) at
+// 1.2GHz, and so is /tmp/cpu_freq, which it leaves behind for others to read.
 void PLAT_setCPUSpeed(int speed) {
-	int freq = 0;
+	int freq;
 	switch (speed) {
 		case CPU_SPEED_MENU: 		freq =  504000; break;
 		case CPU_SPEED_POWERSAVE:	freq = 1104000; break;
-		case CPU_SPEED_NORMAL: 		freq = 1296000; break;
 		case CPU_SPEED_PERFORMANCE: freq = 1488000; break;
+		case CPU_SPEED_NORMAL:      // overclock.elf maps 1296000 to 1200000
+		default: 					freq = 1200000; break;
 	}
-	
-	char cmd[32];
-	sprintf(cmd, "overclock.elf %d\n", freq);
-	system(cmd);
+
+	char value[16];
+	int len = snprintf(value, sizeof(value), "%d\n", freq);
+	for (int cpu=0; cpu<4; cpu++) {
+		char path[64];
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
+		writeSysfs(path, value, len);
+	}
+	writeSysfs("/tmp/cpu_freq", value, len);
+	LOG_info("overclocked to: %d\n", freq);
 }
 
 #define RUMBLE_PATH "/sys/class/power_supply/battery/moto"

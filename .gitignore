@@ -1,11 +1,14 @@
 .DS_Store
 
 build
+bench/
 cores/src
 cores/output
 private
 releases
 src/boot/output
+external/*/target
+*.pyc
 tools
 
 *.o
@@ -13,5 +16,3 @@ tools
 *.elf
 *.dtb
 *.zip
-perf-update/cache
-perf-update/output

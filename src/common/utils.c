@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <math.h>
@@ -47,6 +48,19 @@ int exactMatch(char* str1, char* str2) {
  */
 int hide(char* file_name) {
     return file_name[0]=='.' || suffixMatch(".disabled", file_name) || exactMatch("neogeo.zip", file_name);
+}
+
+// mame_list is sorted by code in byte order (strcmp) with no duplicates, so
+// a binary search finds exactly what the old linear scan did. The scan
+// walked all ~40k entries for every file that wasn't a MAME set: ~3-4ms a
+// file, memory bound, so a 3000 file folder took 9-13s to open.
+static int mameCompare(const void* key, const void* entry) {
+    return strcmp((const char*)key, ((const mamedb*)entry)->code);
+}
+static const mamedb* mameLookup(const char* code) {
+    static size_t count = 0;
+    if (!count) while (mame_list[count].code) count++; // excluding the NULL terminator
+    return bsearch(code, mame_list, count, sizeof(mamedb), mameCompare);
 }
 
 /**
@@ -101,12 +115,10 @@ int getDisplayName(const char* in_name, char* out_name) {
     // --- END OF "DOT" LOGIC ---
 
     // If arcade list, look up real name in MAME database
-    for (int i = 0; mame_list[i].code != NULL; i++) {
-        if (strcmp(mame_list[i].code, out_name) == 0) {
-            mame_index = i; // Save the array index for future reference in O(1) lookups
-            strcpy(out_name, mame_list[i].name);
-            break; // Optimization: stop searching once a match is found
-        }
+    const mamedb* hit = mameLookup(out_name);
+    if (hit) {
+        mame_index = hit - mame_list; // Save the array index for future reference in O(1) lookups
+        strcpy(out_name, hit->name);
     }
 
     // Remove trailing parens (round and square)
@@ -137,6 +149,22 @@ int getDisplayName(const char* in_name, char* out_name) {
  */
 const char* getMameName(int index) {
     return mame_list[index].name;
+}
+
+const char* const RA_ARCADE_TAGS[] = {
+    "MAME", "KMMAME", "KMMAMECPS", "MAME2003P", "FBANEO", "FBNEOCPS", "FBNEOGEO", NULL,
+};
+
+int isArcadeTag(const char* tag) {
+    if (!tag) return 0;
+    for (int i = 0; RA_ARCADE_TAGS[i]; i++)
+        if (!strcasecmp(RA_ARCADE_TAGS[i], tag)) return 1;
+    return 0;
+}
+
+int sameRaSystem(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    return !strcasecmp(a, b) || (isArcadeTag(a) && isArcadeTag(b));
 }
 
 /**

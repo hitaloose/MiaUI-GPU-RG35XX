@@ -12,17 +12,19 @@
 #include <errno.h>
 #include <zlib.h>
 
+#include <ctype.h>
 #include "libretro.h"
 #include "defines.h"
 #include "api.h"
 #include "utils.h"
+#include "i18n.h"
 
 ///////////////////////////////////////
 
 static SDL_Surface* screen;
 static int quit;
 static int show_menu;
-static int simple_mode = 0;
+static int kids_mode = 0; // minui's Kids Mode: no Options in the pause menu
 
 enum {
     SCALE_NATIVE,
@@ -38,10 +40,45 @@ void __log_finite(void){}
 static int screen_scaling = SCALE_ASPECT;
 static int screen_sharpness = SHARPNESS_CRISP;
 static int prevent_tearing = 1; // lenient
+static int sync_to = 0; // FE_OPT_SYNC: 0 video, 1 audio
 static int show_debug = 0;
 static int max_ff_speed = 3; // 4x
 static int fast_forward = 0;
 static int overclock = 1; // normal
+// RetroAchievements, set in minui's Quick Menu: read from msettings at boot
+static int achievements_enabled = 1; // the global switch, set in minui
+static int achievements_game = 1;    // FE_OPT_ACHIEVEMENTS: this game's own, saved with its options
+static int achievement_sound = 1;
+static int achievement_notify = 0;   // RA_NOTIFY_ALL
+
+// PLAT_VIDEO_* from the command line (--32bits, --gl), fixed for the session
+static int video_mode = 0;
+
+// Bytes per pixel of the core's framebuffer, from RETRO_ENVIRONMENT_SET_PIXEL_FORMAT.
+// 2 = RGB565 (the default every core gets if it never asks), 4 = XRGB8888,
+// which is only ever accepted with --32bits or --gl.
+static int core_pixel_bpp = 2;
+
+// which state shortcut waits for the end of the frame, in GL mode (see input_poll_callback)
+enum { HW_PENDING_NONE, HW_PENDING_SAVE, HW_PENDING_LOAD };
+
+// Hardware rendering state (--gl), see HW_setRender
+static struct {
+    int requested; // the core's SET_HW_RENDER was accepted
+    int active;    // the FBO exists and context_reset has run
+    int sw_frame;  // the last frame shown was a software one
+    int pending;   // HW_PENDING_*
+    unsigned fbo;
+    struct retro_hw_render_callback cb;
+} hwr;
+
+// ASSET_TROPHY is 10x10 in the atlas and stands in for the word
+// "achievement" wherever it would otherwise be spelled out.
+#define RA_ICON_SIZE 10 // logical px, matches the atlas rect
+#define RA_ICON_GAP   4 // logical px between the icon and the text it labels
+
+// frames the in-game toast takes to rise into place from the bottom edge
+#define RA_TOAST_RISE_FRAMES 12
 static int DEVICE_WIDTH = FIXED_WIDTH;
 static int DEVICE_HEIGHT = FIXED_HEIGHT;
 static int DEVICE_PITCH = FIXED_PITCH;
@@ -53,6 +90,7 @@ GFX_Renderer renderer;
 
 static struct Core {
     int initialized;
+    int loaded;        // retro_load_game() accepted the content
     int need_fullpath;
     
     const char tag[8]; // eg. GBC
@@ -92,6 +130,36 @@ static struct Core {
     
     // retro_audio_buffer_status_callback_t audio_buffer_status;
 } core;
+
+// The core's frame, with d8-d15 saved around it. AAPCS makes them callee saved,
+// but PCSX ReARMed's NEON GTE (gteRTPT_sf1lm0_neon) writes q4-q6 and its
+// dynarec entry saves only r4-r11: every 3D frame of Tekken 3 came back with
+// d9-d15 changed, on the 2021 build and r26 alike. GCC keeps loop constants
+// there across the call (main held limitFF's 1000000.0 in d9), so they're
+// restored here, for any core, rather than trusting each one.
+void Core_callSavingVFP(void (*fn)(void));
+#if defined(__arm__)
+__asm__(
+    ".text\n"
+    ".align 2\n"
+    ".arm\n"
+    ".fpu neon\n"
+    ".global Core_callSavingVFP\n"
+    ".type Core_callSavingVFP, %function\n"
+    "Core_callSavingVFP:\n"
+    "    push    {r4, lr}\n"   // with the 64 below, 72 bytes: still 8-aligned
+    "    vpush   {d8-d15}\n"
+    "    blx     r0\n"
+    "    vpop    {d8-d15}\n"
+    "    pop     {r4, pc}\n"
+    ".size Core_callSavingVFP, .-Core_callSavingVFP\n"
+);
+#else
+void Core_callSavingVFP(void (*fn)(void)) { fn(); }
+#endif
+static void Core_run(void) {
+    Core_callSavingVFP(core.run);
+}
 
 ///////////////////////////////////////
 // based on picoarch/unzip.c
@@ -171,6 +239,9 @@ static int Zip_inflate(FILE* zip, FILE* dst, size_t size) { // compressed
 
 ///////////////////////////////////////
 
+#include "ra_offline.h"
+#include "profile.h"
+
 static struct Game {
     char path[MAX_PATH];
     char name[MAX_PATH]; // TODO: rename to basename?
@@ -180,6 +251,10 @@ static struct Game {
     size_t size;
     int is_open;
 } game;
+// RETRO_ENVIRONMENT_GET_GAME_INFO_EXT (filled by GameInfoExt_fill in Core_load)
+static struct retro_game_info_ext game_info_ext;
+static int game_info_ext_ready;
+static char game_info_ext_dir[MAX_PATH], game_info_ext_name[MAX_PATH], game_info_ext_ext[16], game_info_ext_file[MAX_PATH];
 static void Game_open(char* path) {
     LOG_info("Game_open\n");
     memset(&game, 0, sizeof(game));
@@ -347,6 +422,7 @@ static void Game_open(char* path) {
     game.is_open = 1;
 }
 static void Game_close(void) {
+    game_info_ext_ready = 0;
     if (game.data) free(game.data);
     if (game.tmp_path[0]) remove(game.tmp_path);
     game.is_open = 0;
@@ -443,23 +519,21 @@ static void SRAM_write(void) {
     char filename[MAX_PATH];
     SRAM_getPath(filename);
     LOG_info("sav path (write): %s\n", filename);
-        
-    FILE *sram_file = fopen(filename, "w");
-    if (!sram_file) {
-        LOG_error("Error opening SRAM file: %s\n", strerror(errno));
+
+    // A snapshot, because the core keeps running while the writer works.
+    // The writer replaces the file atomically, so a power cut mid-save leaves
+    // the previous .sav rather than a truncated one.
+    void* copy = malloc(sram_size);
+    if (!copy) {
+        LOG_error("Error allocating SRAM snapshot\n");
         return;
     }
+    memcpy(copy, sram, sram_size);
+    IO_writeFile(filename, copy, sram_size);
 
-    if (sram_size != fwrite(sram, 1, sram_size, sram_file)) {
-        LOG_error("Error writing SRAM data to file\n");
-    } else {
-        // ÉXITO: Actualizamos el hash de referencia
-        last_sram_hash = current_hash;
-        sram_hash_initialized = 1;
-    }
-
-    fclose(sram_file);
-    sync();
+    // ÉXITO: Actualizamos el hash de referencia
+    last_sram_hash = current_hash;
+    sram_hash_initialized = 1;
 }
 
 ///////////////////////////////////////
@@ -493,22 +567,15 @@ static void RTC_write(void) {
     char filename[MAX_PATH];
     RTC_getPath(filename);
     printf("rtc path (write) size(%u): %s\n", rtc_size, filename);
-        
-    FILE *rtc_file = fopen(filename, "w");
-    if (!rtc_file) {
-        LOG_error("Error opening RTC file: %s\n", strerror(errno));
-        return;
-    }
 
     void *rtc = core.get_memory_data(RETRO_MEMORY_RTC);
-
-    if (!rtc || rtc_size != fwrite(rtc, 1, rtc_size, rtc_file)) {
+    void* copy = rtc ? malloc(rtc_size) : NULL;
+    if (!copy) {
         LOG_error("Error writing RTC data to file\n");
+        return;
     }
-
-    fclose(rtc_file);
-
-    sync();
+    memcpy(copy, rtc, rtc_size);
+    IO_writeFile(filename, copy, rtc_size);
 }
 
 ///////////////////////////////////////
@@ -521,6 +588,10 @@ static void State_read(void) { // from picoarch
     size_t state_size = core.serialize_size();
     if (!state_size) return;
 
+    // a save of this slot may still be on its way to the card
+    IO_flush();
+
+    FILE *state_file = NULL;
     void *state = calloc(1, state_size);
     if (!state) {
         LOG_error("Couldn't allocate memory for state\n");
@@ -530,7 +601,7 @@ static void State_read(void) { // from picoarch
     char filename[MAX_PATH];
     State_getPath(filename);
     
-    FILE *state_file = fopen(filename, "r");
+    state_file = fopen(filename, "r");
     if (!state_file) {
         if (state_slot!=8) { // st8 is a default state in MiniUI and may not exist, that's okay
             LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
@@ -550,6 +621,9 @@ static void State_read(void) { // from picoarch
         goto error;
     }
 
+    // the loaded state is unrelated to whatever the triggers were tracking
+    RA_resetRuntime();
+
 error:
     if (state) free(state);
     if (state_file) fclose(state_file);
@@ -561,33 +635,21 @@ static void State_write(void) { // from picoarch
     void *state = calloc(1, state_size);
     if (!state) {
         LOG_error("Couldn't allocate memory for state\n");
-        goto error;
+        return;
     }
 
     char filename[MAX_PATH];
     State_getPath(filename);
-    
-    FILE *state_file = fopen(filename, "w");
-    if (!state_file) {
-        LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
-        goto error;
-    }
 
+    // Serialising has to happen here, between frames. Writing it out doesn't:
+    // ~300ms for a PS state on this card, so the writer thread takes it and
+    // the buffer with it.
     if (!core.serialize(state, state_size)) {
         LOG_error("Error creating save state: %s (%s)\n", filename, strerror(errno));
-        goto error;
+        free(state);
+        return;
     }
-
-    if (state_size != fwrite(state, 1, state_size, state_file)) {
-        LOG_error("Error writing state data to file: %s (%s)\n", filename, strerror(errno));
-        goto error;
-    }
-
-error:
-    if (state) free(state);
-    if (state_file) fclose(state_file);
-
-    sync();
+    IO_writeFile(filename, state, state_size);
 }
 static void State_autosave(void) {
     int last_state_slot = state_slot;
@@ -653,6 +715,11 @@ static char* tearing_labels[] = {
     "Strict",
     NULL
 };
+static char* sync_labels[] = {
+    "Video",
+    "Audio",
+    NULL
+};
 static char* max_ff_labels[] = {
     "None",
     "2x",
@@ -671,9 +738,11 @@ enum {
     FE_OPT_SCALING,
     FE_OPT_SHARPNESS,
     FE_OPT_TEARING,
+    FE_OPT_SYNC,
     FE_OPT_OVERCLOCK,
     FE_OPT_DEBUG,
     FE_OPT_MAXFF,
+    FE_OPT_ACHIEVEMENTS,
     FE_OPT_COUNT,
 };
 
@@ -932,6 +1001,29 @@ static char* button_labels[] = {
     "MENU+R3",
     NULL,
 };
+
+// How a (button, mod) pair is packed into an index into button_labels:
+//   0            NONE
+//   1 .. N       the plain buttons
+//   N+1 .. 2N    the same list again, with MENU+ in front
+//
+// N is the number of buttons a user may bind: everything before MENU in the
+// BTN_ID_* enum. MENU itself and what follows it (PLUS, MINUS, POWER,
+// POWEROFF) belong to the system, have no label here, and must never be
+// packed into one of these indices.
+//
+// Deliberately NOT LOCAL_BUTTON_COUNT. That counts every button the device
+// reports - 23 - which is seven more than button_labels has entries for, so
+// using it as the offset put MENU+SELECT and everything after it past the end
+// of the table.
+#define BINDABLE_BUTTON_COUNT BTN_ID_MENU
+
+// Compile check:
+// Fails the build if the table and the constant ever drift: NONE + N + N + NULL.
+typedef char button_labels_size_check[
+    (sizeof(button_labels) / sizeof(button_labels[0])
+     == 2 * BINDABLE_BUTTON_COUNT + 2) ? 1 : -1];
+
 static char* overclock_labels[] = {
     "Powersave",
     "Normal",
@@ -989,6 +1081,16 @@ static struct Config {
                 .values = tearing_labels,
                 .labels = tearing_labels,
             },
+            [FE_OPT_SYNC] = {
+                .key    = "minarch_sync_to",
+                .name    = "Sync To",
+                .desc    = "Video: smooth, the game runs up to 2% fast\nto match the screen. Audio: exact speed, a\nframe repeats now and then. 50Hz uses Audio.",
+                .default_value = 0, // Video
+                .value = 0,
+                .count = 2,
+                .values = sync_labels,
+                .labels = sync_labels,
+            },
             [FE_OPT_OVERCLOCK] = {
                 .key    = "minarch_cpu_speed",
                 .name    = "CPU Speed",
@@ -1018,6 +1120,16 @@ static struct Config {
                 .count = 8,
                 .values = max_ff_labels,
                 .labels = max_ff_labels,
+            },
+            [FE_OPT_ACHIEVEMENTS] = {
+                .key    = "minarch_achievements",
+                .name    = "Achievements",
+                .desc    = "Track RetroAchievements in this game.\nOff brings save states back at once,\nOn applies from the next launch.",
+                .default_value = 1,
+                .value = 1,
+                .count = 2,
+                .values = onoff_labels,
+                .labels = onoff_labels,
             },
             [FE_OPT_COUNT] = {NULL}
         }
@@ -1084,6 +1196,11 @@ static void Config_syncFrontend(char* key, int value) {
         prevent_tearing = value;
         i = FE_OPT_TEARING;
     }
+    else if (exactMatch(key,config.frontend.options[FE_OPT_SYNC].key)) {
+        sync_to = value;
+        SND_setVideoSync(sync_to==0); // re-decided on the next audio batch, so it applies at once
+        i = FE_OPT_SYNC;
+    }
     else if (exactMatch(key,config.frontend.options[FE_OPT_OVERCLOCK].key)) {
         overclock = value;
         i = FE_OPT_OVERCLOCK;
@@ -1095,6 +1212,15 @@ static void Config_syncFrontend(char* key, int value) {
     else if (exactMatch(key,config.frontend.options[FE_OPT_MAXFF].key)) {
         max_ff_speed = value;
         i = FE_OPT_MAXFF;
+    }
+    else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENTS].key)) {
+        achievements_game = value;
+        // Off takes effect now: the set goes (its progress flushed if need
+        // be) and with it the hardcore rules, so save states come back. On
+        // waits for the next launch: a state may have been loaded since the
+        // game started, and the core's memory map is only reported at load.
+        if (!value && RA_isActive()) RA_unloadGame();
+        i = FE_OPT_ACHIEVEMENTS;
     }
     if (i==-1) return;
     Option* option = &config.frontend.options[i];
@@ -1236,8 +1362,8 @@ static void Config_readControlsString(char* cfg) {
             }
             
             int mod = 0;
-            if (id >= LOCAL_BUTTON_COUNT) {
-                id -= LOCAL_BUTTON_COUNT;
+            if (id >= BINDABLE_BUTTON_COUNT) {
+                id -= BINDABLE_BUTTON_COUNT;
                 mod = 1;
             }
             
@@ -1282,8 +1408,8 @@ static void Config_readControlsString(char* cfg) {
         }
         
         int mod = 0;
-        if (id>=LOCAL_BUTTON_COUNT) {
-            id -= LOCAL_BUTTON_COUNT;
+        if (id>=BINDABLE_BUTTON_COUNT) {
+            id -= BINDABLE_BUTTON_COUNT;
             mod = 1;
         }
         // LOG_info("shortcut %s:%s (%i:%i)\n", key,value, id, mod);
@@ -1362,7 +1488,7 @@ static void Config_write(int override) {
         ButtonMapping* mapping = &config.controls[i];
         
         int j = mapping->local + 1;
-        if (mapping->mod) j += LOCAL_BUTTON_COUNT;
+        if (mapping->mod) j += BINDABLE_BUTTON_COUNT;
         
         // Si este botón tiene una tecla asignada, guardamos SOLO el bind_key
         if (mapping->retro_key > 0 && mapping->retro_key < RETROK_LAST) {
@@ -1381,7 +1507,7 @@ static void Config_write(int override) {
     for (int i=0; config.shortcuts[i].name; i++) {
         ButtonMapping* mapping = &config.shortcuts[i];
         int j = mapping->local + 1;
-        if (mapping->mod) j += LOCAL_BUTTON_COUNT;
+        if (mapping->mod) j += BINDABLE_BUTTON_COUNT;
         fprintf(file, "bind %s = %s\n", mapping->name, button_labels[j]);
     }
     
@@ -1655,6 +1781,7 @@ static void Menu_afterSleep(void);
 
 static void Menu_saveState(void);
 static void Menu_loadState(void);
+static int Hardcore_active(void);
 
 static uint32_t keyboard_state[RETROK_LAST];
 static uint32_t current_input_frame = 0;
@@ -1700,9 +1827,15 @@ static void input_poll_callback(void) {
             }
             else if (PAD_justPressed(btn)) {
                 switch (i) {
-                    case SHORTCUT_SAVE_STATE: Menu_saveState(); break;
-                    case SHORTCUT_LOAD_STATE: Menu_loadState(); break;
-                    case SHORTCUT_RESET_GAME: core.reset(); break;
+                    // no save states while achievements are active, same as
+                    // RetroAchievements hardcore. The menu hides the rows, so
+                    // block the shortcuts too or it's only cosmetic.
+                    // With a hardware core this runs in the middle of its frame, its
+                    // GL state bound: the thumbnail readback would trample it, so in
+                    // GL mode both wait for the frame to be handed over.
+                    case SHORTCUT_SAVE_STATE: if (!Hardcore_active()) { if (hwr.active) hwr.pending = HW_PENDING_SAVE; else Menu_saveState(); } break;
+                    case SHORTCUT_LOAD_STATE: if (!Hardcore_active()) { if (hwr.active) hwr.pending = HW_PENDING_LOAD; else Menu_loadState(); } break;
+                    case SHORTCUT_RESET_GAME: core.reset(); RA_resetRuntime(); break;
                     case SHORTCUT_CYCLE_SCALE:
                         screen_scaling += 1;
                         if (screen_scaling>=SCALE_COUNT) screen_scaling -= SCALE_COUNT;
@@ -1850,6 +1983,42 @@ static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uin
     VIB_setStrength(strength);
     return 1;
 }
+///////////////////////////////
+// Hardware rendering (--gl)
+//
+// The core renders into an FBO in minarch's own GLES2 context, and that FBO's
+// texture is drawn as the game layer (see PLAT_hwInit).
+
+static uintptr_t HW_getCurrentFramebuffer(void) {
+    return hwr.fbo;
+}
+static retro_proc_address_t HW_getProcAddress(const char* sym) {
+    // not eglGetProcAddress: on this driver it returns NULL for anything
+    // that isn't an extension (glDrawElements, glBindFramebuffer...)
+    return (retro_proc_address_t)SDL_GL_GetProcAddress(sym);
+}
+static bool HW_setRender(unsigned cmd, struct retro_hw_render_callback* cb) {
+    if (!cb) return false;
+
+    // EGL here offers OpenGL ES 2.0 and nothing else
+    int ok = cb->context_type==RETRO_HW_CONTEXT_OPENGLES2
+          || (cb->context_type==RETRO_HW_CONTEXT_OPENGLES_VERSION && cb->version_major==2);
+    LOG_info("SET_HW_RENDER: context %i (%u.%u) depth %i stencil %i bottom_left %i: %s\n",
+             cb->context_type, cb->version_major, cb->version_minor,
+             cb->depth, cb->stencil, cb->bottom_left_origin, ok ? "accepted" : "refused, GLES2 only");
+    if (!ok) return false;
+
+    cb->get_current_framebuffer = HW_getCurrentFramebuffer;
+    cb->get_proc_address = HW_getProcAddress;
+
+    // the old experimental ABI ends before stencil: don't copy garbage
+    memset(&hwr.cb, 0, sizeof(hwr.cb));
+    if (cmd & RETRO_ENVIRONMENT_EXPERIMENTAL) memcpy(&hwr.cb, cb, offsetof(struct retro_hw_render_callback, stencil));
+    else memcpy(&hwr.cb, cb, sizeof(hwr.cb));
+    hwr.requested = 1;
+    return true;
+}
+
 static bool environment_callback(unsigned cmd, void *data) { // copied from picoarch initially
     // LOG_info("environment_callback: %i\n", cmd);
     
@@ -1891,11 +2060,37 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: { /* 10 */
         const enum retro_pixel_format *format = (enum retro_pixel_format *)data;
 
-        if (*format != RETRO_PIXEL_FORMAT_RGB565) { // TODO: pull from platform.h?
-            /* 565 is only supported format */
-            return false;
+        if (*format == RETRO_PIXEL_FORMAT_RGB565) {
+            core_pixel_bpp = 2;
+            break;
         }
-        break;
+
+        // XRGB8888 goes to the GPU untouched as BGRA, so it only costs the
+        // doubled upload - but only when asked for (--32bits, --gl), so the
+        // default stays the 16-bit path. Cores that insist on it (Mesen, the
+        // GL cores) refuse to load without it.
+        if (*format == RETRO_PIXEL_FORMAT_XRGB8888 && PLAT_supports32Bit()) {
+            core_pixel_bpp = 4;
+            LOG_info("pixel format: XRGB8888 (32-bit)\n");
+            break;
+        }
+
+        /* 0RGB1555 is deprecated upstream and nothing we ship asks for it */
+        return false;
+    }
+    case RETRO_ENVIRONMENT_SET_HW_RENDER: /* 14 */
+    case RETRO_ENVIRONMENT_SET_HW_RENDER | RETRO_ENVIRONMENT_EXPERIMENTAL: {
+        if (!(video_mode & PLAT_VIDEO_GL)) return false; // as before: software only
+        return HW_setRender(cmd, (struct retro_hw_render_callback*)data);
+    }
+    // RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER (56) stays unanswered on
+    // purpose, like RetroArch with driver switching off: cores then walk
+    // their own list down to GLES2. Answering GLES2 outright breaks PPSSPP,
+    // which only builds its GL context for DUMMY, OPENGL or OPENGLES3.
+    case RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT: { /* 44 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+        // Not implemented yet: logged so we know which cores ask for it
+        if (video_mode & PLAT_VIDEO_GL) LOG_info("SET_HW_SHARED_CONTEXT requested (not supported)\n");
+        return false;
     }
     case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: { /* 11 */
         // puts("RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS\n");
@@ -1977,7 +2172,12 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         break;
     }
     // RETRO_ENVIRONMENT_SET_CONTROLLER_INFO 35
-    // RETRO_ENVIRONMENT_SET_MEMORY_MAPS (36 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+    case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: { /* 36 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+        // only consumed by the achievement runtime, which needs the core's
+        // address space to resolve the addresses baked into the triggers
+        RA_setMemoryMap((const struct retro_memory_map *)data);
+        break;
+    }
     // RETRO_ENVIRONMENT_GET_LANGUAGE 39
     // RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS (42 | RETRO_ENVIRONMENT_EXPERIMENTAL)
     // RETRO_ENVIRONMENT_GET_VFS_INTERFACE (45 | RETRO_ENVIRONMENT_EXPERIMENTAL)
@@ -2069,7 +2269,12 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
         // if (info) LOG_info("has overrides");
         break;
     }
-    // RETRO_ENVIRONMENT_GET_GAME_INFO_EXT 66
+    case RETRO_ENVIRONMENT_GET_GAME_INFO_EXT: { /* 66 */
+        // only once Core_load has filled it: libretro allows the call inside retro_load_game() only
+        if (!game_info_ext_ready || !data) return false;
+        *(const struct retro_game_info_ext**)data = &game_info_ext;
+        return true;
+    }
     // TODO: RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK 69
     // used by fceumm
     // TODO: used by gambatte for L/R palette switching (seems like it needs to return true even if data is NULL to indicate support)
@@ -2111,8 +2316,9 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 
 ///////////////////////////////
 
-// TODO: this is a dumb API
-SDL_Surface* digits;
+// The debug HUD: each digit or sign in a black cell of its own, DIGIT_WIDTH
+// apart less the tracking, so the numbers don't jitter as they change. The
+// glyphs come from the text cache, so this draws, it doesn't render.
 #define DIGIT_WIDTH 9
 #define DIGIT_HEIGHT 8
 #define DIGIT_TRACKING -2
@@ -2126,23 +2332,23 @@ enum {
     DIGIT_COUNT,
 };
 #define DIGIT_SPACE DIGIT_COUNT
-static void MSG_init(void) {
-    digits = SDL_CreateRGBSurface(SDL_SWSURFACE,SCALE2(DIGIT_WIDTH*DIGIT_COUNT,DIGIT_HEIGHT),FIXED_DEPTH, 0,0,0,0);
-    SDL_FillRect(digits, NULL, RGB_BLACK);
-    
-    SDL_Surface* digit;
-    char* chars[] = { "0","1","2","3","4","5","6","7","8","9","/",".","%","x","(",")", NULL };
-    char* c;
-    int i = 0;
-    while ((c = chars[i])) {
-        digit = TTF_RenderUTF8_Blended(font.tiny, c, COLOR_WHITE);
-        SDL_BlitSurface(digit, NULL, digits, &(SDL_Rect){ (i * SCALE1(DIGIT_WIDTH)) + (SCALE1(DIGIT_WIDTH) - digit->w)/2, (SCALE1(DIGIT_HEIGHT) - digit->h)/2});
-        SDL_FreeSurface(digit);
-        i += 1;
-    }
+static const char* digit_chars[DIGIT_COUNT] = { "0","1","2","3","4","5","6","7","8","9","/",".","%","x","(",")" };
+
+// a line of text vertically centred in a black DIGIT_HEIGHT strip, and
+// cropped to it
+static void MSG_blitCell(GFX_Text* text, int x, int y, int w) {
+    int cell_h = SCALE1(DIGIT_HEIGHT);
+    GFX_fillRect(screen, &(SDL_Rect){x,y,w,cell_h}, COLOR_BLACK, 255);
+    if (!text->tex) return;
+    int oy = (cell_h - text->h) / 2;
+    if (oy<0) GFX_blitRenderedText(text, &(SDL_Rect){0,-oy,text->w,cell_h}, screen, x + (w - text->w)/2, y);
+    else GFX_blitRenderedText(text, NULL, screen, x + (w - text->w)/2, y + oy);
 }
 static int MSG_blitChar(int n, int x, int y) {
-    if (n!=DIGIT_SPACE) SDL_BlitSurface(digits, &(SDL_Rect){n*SCALE1(DIGIT_WIDTH),0,SCALE2(DIGIT_WIDTH,DIGIT_HEIGHT)}, screen, &(SDL_Rect){x,y});
+    if (n!=DIGIT_SPACE) {
+        GFX_Text text = GFX_renderText(font.tiny, digit_chars[n], COLOR_WHITE);
+        MSG_blitCell(&text, x, y, SCALE1(DIGIT_WIDTH));
+    }
     return x + SCALE1(DIGIT_WIDTH + DIGIT_TRACKING);
 }
 static int MSG_blitInt(int num, int x, int y) {
@@ -2190,9 +2396,6 @@ static int MSG_blitDouble(double num, int x, int y) {
     x = MSG_blitChar(n,x,y);
     return x;
 }
-static void MSG_quit(void) {
-    SDL_FreeSurface(digits);
-}
 
 ///////////////////////////////
 
@@ -2204,7 +2407,7 @@ static double cpu_double = 0;
 static double use_double = 0;
 static uint32_t sec_start = 0;
 
-static SDL_Surface* scaler_surface;
+static char scaler_name[16]; // for the debug HUD
 
 #ifdef USES_SWSCALER
     static int fit = 1;
@@ -2228,8 +2431,6 @@ static void selectScaler(int src_w, int src_h, int src_p) {
         aspect_w += aspect_w % 2;
     }
 
-    char scaler_name[16];
-    
     src_x = 0;
     src_y = 0;
     dst_x = 0;
@@ -2365,6 +2566,7 @@ static void selectScaler(int src_w, int src_h, int src_p) {
     renderer.src_w = src_w;
     renderer.src_h = src_h;
     renderer.src_p = src_p;
+    renderer.src_bpp = core_pixel_bpp;
     renderer.dst_x = dst_x;
     renderer.dst_y = dst_y;
     renderer.dst_w = dst_w;
@@ -2387,18 +2589,6 @@ static void selectScaler(int src_w, int src_h, int src_p) {
          aspect_w,aspect_h
      );
 
-    if (fit) {
-        dst_w = DEVICE_WIDTH;
-        dst_h = DEVICE_HEIGHT;
-    }
-    
-    if (screen->w!=dst_w || screen->h!=dst_h || screen->pitch!=dst_p) {
-        screen = GFX_resize(dst_w,dst_h,dst_p);
-    }
-    
-    // DEBUG HUD
-    if (scaler_surface) SDL_FreeSurface(scaler_surface);
-    scaler_surface = TTF_RenderUTF8_Blended(font.tiny, scaler_name, COLOR_WHITE);
 }
 static void video_refresh_callback(const void *data, unsigned width, unsigned height, size_t pitch) {
     // return;
@@ -2413,6 +2603,8 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     // but 10 hurts PS...
     // TODO: 10 was based on rg35xx, probably different results on other supported platforms
     if (fast_forward && SDL_GetTicks()-last_flip_time<10) return;
+
+    PROF_BEGIN(PROF_VIDEO);
     
     // FFVII menus 
     // 16: 30/200
@@ -2424,34 +2616,41 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
     // you can squeeze more out of every console by turning prevent tearing off
     // eg. PS@10 60/240
     
-    if (!data) return;
+    // NULL is the core saying "same picture as last time"; 30fps games do it
+    // every other frame. When the audio ring sets the pace there's nothing to
+    // do. When vsync does, every retro_run has to take exactly one refresh,
+    // or a 30fps game runs ahead of its audio - so show the last frame again.
+    int repeat = !data;
+    if (repeat && (!SND_isVideoClocked() || fast_forward)) return;
 
-    fps_ticks += 1;
+    if (!repeat) fps_ticks += 1;
     
     // if source has changed size (or forced by dst_p==0)
     // eg. true src + cropped src + fixed dst + cropped dst
-    if (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h) {
+    if (!repeat && (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h)) {
         selectScaler(width, height, pitch);
         GFX_clearAll();
     }
     
-    // debug
+    // debug: the widest the HUD has been, so a shorter line leaves nothing behind
     static int top_width = 0;
     static int bottom_width = 0;
-    if (top_width) SDL_FillRect(screen, &(SDL_Rect){0,0,top_width,DIGIT_HEIGHT}, RGB_BLACK);
-    if (bottom_width) SDL_FillRect(screen, &(SDL_Rect){0,screen->h-DIGIT_HEIGHT,bottom_width,DIGIT_HEIGHT}, RGB_BLACK);
+    if (show_debug) {
+        if (top_width) GFX_fillRect(screen, &(SDL_Rect){0,0,top_width,SCALE1(DIGIT_HEIGHT)}, COLOR_BLACK, 255);
+        if (bottom_width) GFX_fillRect(screen, &(SDL_Rect){0,screen->h-SCALE1(DIGIT_HEIGHT),bottom_width,SCALE1(DIGIT_HEIGHT)}, COLOR_BLACK, 255);
+    }
     
-    renderer.src = (void*)data;
-    renderer.dst = screen->pixels;
-    // LOG_info("video_refresh_callback: %ix%i@%i %ix%i@%i\n",width,height,pitch,screen->w,screen->h,screen->pitch);
-    GFX_blitRenderer(&renderer);
+    if (repeat) {
+        GFX_repeatFrame(); // renderer.src keeps the last real frame for the menu's snapshot
+    }
+    else {
+        renderer.src = (void*)data;
+        GFX_blitRenderer(&renderer);
+    }
     
     if (show_debug) {
         int x = 0;
         int y = screen->h - SCALE1(DIGIT_HEIGHT);
-#if defined(USE_SDL2)
-        y = height - SCALE1(DIGIT_HEIGHT); // TODO: tmp?
-#endif
         
         if (fps_double) x = MSG_blitDouble(fps_double, x,y);
         
@@ -2466,7 +2665,7 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
             x = MSG_blitChar(DIGIT_PERCENT,x,y);
         }
         
-        if (x>bottom_width) bottom_width = x; // keep the largest width because triple buffer
+        if (x>bottom_width) bottom_width = x;
         
         x = 0;
         y = 0;
@@ -2486,18 +2685,136 @@ static void video_refresh_callback(const void *data, unsigned width, unsigned he
         x = MSG_blitChar(DIGIT_CP,x,y);
         x = MSG_blitChar(DIGIT_SPACE,x,y);
         
-        if (scaler_surface) {
-            SDL_FillRect(screen, &(SDL_Rect){x,y,scaler_surface->w,SCALE1(DIGIT_HEIGHT)}, RGB_BLACK);
-            SDL_BlitSurface(scaler_surface, NULL, screen, &(SDL_Rect){x,y+((SCALE1(DIGIT_HEIGHT) - scaler_surface->h)/2)});
-            x += SCALE1(DIGIT_WIDTH) * 3;
+        GFX_Text scaler = GFX_renderText(font.tiny, scaler_name, COLOR_WHITE);
+        if (scaler.tex) {
+            MSG_blitCell(&scaler, x, y, scaler.w);
+            x += scaler.w;
         }
         
-        if (x>top_width) top_width = x; // keep the largest width because triple buffer
+        if (x>top_width) top_width = x;
     }
     
-    PLAT_setUIInGame(show_debug);
+    // achievement popup
+    //
+    // A render target of its own (GFX_loadToast), drawn once per message and
+    // slid in by moving its quad, so the full-screen ui layer can stay off in
+    // game while it shows.
+    {
+        static uint32_t ra_toast_id = 0;
+        static int ra_toast_w = 0;
+        static int ra_rise = 0;
+
+        // the pill is a fixed height (GFX_blitPill crops rather than scales the
+        // rounded caps, so anything but PILL_SIZE clips the corners) and the
+        // strip it travels through is that plus the bottom margin
+        const int ra_pill_h  = SCALE1(PILL_SIZE);
+        const int ra_strip_h = ra_pill_h + SCALE1(PADDING);
+
+        const char* ra_msg = RA_getMessage();
+
+        // only rasterize when the text actually changes, not every frame
+        if (ra_msg && RA_getMessageId()!=ra_toast_id) {
+            ra_toast_id = RA_getMessageId();
+            ra_toast_w = 0;
+            ra_rise = 0; // a new message slides in from off screen
+
+            // a long achievement title would run out past the rounded cap, so
+            // clip it to what fits between the insets instead
+            char ra_text[256];
+            GFX_truncateText(font.tiny, ra_msg, ra_text,
+                             DEVICE_WIDTH - SCALE1(PADDING*2 + BUTTON_PADDING*2
+                                                   + RA_ICON_SIZE + RA_ICON_GAP), 0);
+            GFX_Text text = GFX_renderText(font.tiny, ra_text, COLOR_WHITE);
+
+            if (text.tex) {
+                // trophy, gap, text -- the icon says "achievement" so the message
+                // itself is just the title or the tally. Insets match the title
+                // pill's, so the content clears the rounded caps.
+                int icon_x = SCALE1(BUTTON_PADDING);
+                int text_x = icon_x + SCALE1(RA_ICON_SIZE);
+                int pill_w = MIN(text_x + text.w + SCALE1(BUTTON_PADDING),
+                                 DEVICE_WIDTH - SCALE1(PADDING*2));
+
+                // starts transparent, so the rounded corners stay that way
+                SDL_Surface* pill = GFX_createSurface(pill_w, ra_pill_h);
+                if (pill) {
+                    GFX_blitPill(ASSET_DARK_GRAY_PILL, pill, &(SDL_Rect){0, 0, pill_w, ra_pill_h});
+                    GFX_blitAsset(ASSET_TROPHY, NULL, pill, &(SDL_Rect){
+                        icon_x, (ra_pill_h - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                    GFX_blitRenderedText(&text, NULL, pill, text_x, (ra_pill_h - text.h) / 2);
+                    GFX_loadToast(pill); // the platform owns it from here
+                    ra_toast_w = pill_w;
+                }
+            }
+        }
+
+        if (ra_msg && ra_toast_w) {
+            // quadratic ease-out off the bottom edge: quick away from the edge,
+            // settling gently into place
+            int rem  = RA_TOAST_RISE_FRAMES - ra_rise;
+            int rise = (ra_strip_h * rem * rem) / (RA_TOAST_RISE_FRAMES * RA_TOAST_RISE_FRAMES);
+            if (ra_rise<RA_TOAST_RISE_FRAMES) ra_rise++;
+
+            GFX_showToast(1, SCALE1(PADDING), DEVICE_HEIGHT - ra_strip_h + rise);
+        }
+        else {
+            GFX_showToast(0, 0, 0);
+        }
+    }
+    
+    // In game the ui layer is empty unless the debug overlay is up, so tell
+    // the platform and it skips compositing a full-screen texture every frame.
+    {
+        static int ui_was_wanted = 1;
+        int ui_wanted = show_debug;
+
+        // Clear on the way *down*, not on the way back up: clearing when it
+        // reappears would wipe whatever was just drawn into it this frame.
+        // Then nothing stale can resurface the next time it is needed.
+        if (!ui_wanted && ui_was_wanted) GFX_clearAll();
+
+        GFX_setUILayer(ui_wanted);
+        ui_was_wanted = ui_wanted; // intent, so the clear happens exactly once
+    }
+
+    PROF_END(PROF_VIDEO);
+
     GFX_flip(screen);
     last_flip_time = SDL_GetTicks();
+
+    PROF_FRAME();
+}
+// Only registered once a core's hardware context is up (Core_load). A frame
+// from the GPU goes through the software callback above untouched: for it,
+// PLAT_getScaler hands out a "scaler" that points the game layer at the FBO
+// instead of queueing an upload, and the pointer (RETRO_HW_FRAME_BUFFER_VALID)
+// is never read. So the software path is the same code it always was.
+static void video_refresh_callback_hw(const void *data, unsigned width, unsigned height, size_t pitch) {
+    // whatever the core left bound, the compositor needs its own state back
+    // before it draws anything - the UI resize and the toast upload included
+    PLAT_hwRestoreState();
+
+    // A HW core may still hand over a software frame now and then; that goes
+    // through the normal upload, into the software texture. Either switch
+    // re-selects the scaler.
+    int sw = data!=RETRO_HW_FRAME_BUFFER_VALID;
+    if (data && sw!=hwr.sw_frame) { // NULL is a repeat of whichever it was
+        PLAT_hwPresent(!sw);
+        hwr.sw_frame = sw;
+        renderer.dst_p = 0;
+    }
+    video_refresh_callback(data, width, height, pitch);
+
+    // a state shortcut from this frame's input poll: the frame is complete
+    // and in the FBO now, and the GL state is ours, as RetroArch has it
+    // whenever it saves or loads
+    if (hwr.pending) {
+        int pending = hwr.pending;
+        hwr.pending = HW_PENDING_NONE;
+        if (pending==HW_PENDING_SAVE) Menu_saveState();
+        else Menu_loadState();
+    }
 }
 
 ///////////////////////////////
@@ -2507,8 +2824,13 @@ static void audio_sample_callback(int16_t left, int16_t right) {
     if (!fast_forward) SND_batchSamples(&(const SND_Frame){left,right}, 1);
 }
 static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) { 
-    if (!fast_forward) return SND_batchSamples((const SND_Frame*)data, frames);
-    else return frames;
+    if (fast_forward) return frames;
+
+    PROF_BEGIN(PROF_AUDIO);
+    PROF_COUNT(PROF_AUDIO_FRAMES, frames);
+    size_t taken = SND_batchSamples((const SND_Frame*)data, frames);
+    PROF_END(PROF_AUDIO);
+    return taken;
 };
 
 ///////////////////////////////////////
@@ -2518,11 +2840,26 @@ void Core_getName(char* in_name, char* out_name) {
     char* tmp = strrchr(out_name, '_');
     tmp[0] = '\0';
 }
-void Core_open(const char* core_path, const char* tag_name) {
+// Stashed by Core_open and applied by Core_init. libretro.h only promises
+// these are set before the first retro_run(), but RetroArch calls them after
+// retro_init() and cores are written to that order: Mesen's retro_set_video_refresh
+// does `_console->GetVideoRenderer()->...`, and _console is the shared_ptr that
+// retro_init() fills in -- calling the setters from Core_open dereferences null
+// and dies before the core is even initialised.
+static void (*set_video_refresh_callback)(retro_video_refresh_t);
+static void (*set_audio_sample_callback)(retro_audio_sample_t);
+static void (*set_audio_sample_batch_callback)(retro_audio_sample_batch_t);
+static void (*set_input_poll_callback)(retro_input_poll_t);
+static void (*set_input_state_callback)(retro_input_state_t);
+
+int Core_open(const char* core_path, const char* tag_name) {
     LOG_info("Core_open\n");
     core.handle = dlopen(core_path, RTLD_LAZY);
     
-    if (!core.handle) LOG_error("%s\n", dlerror());
+    if (!core.handle) {
+        LOG_error("Core_open: can't load %s: %s\n", core_path, dlerror());
+        return 0;
+    }
     
     core.init = dlsym(core.handle, "retro_init");
     core.deinit = dlsym(core.handle, "retro_deinit");
@@ -2542,18 +2879,23 @@ void Core_open(const char* core_path, const char* tag_name) {
     core.get_memory_size = dlsym(core.handle, "retro_get_memory_size");
     
     void (*set_environment_callback)(retro_environment_t);
-    void (*set_video_refresh_callback)(retro_video_refresh_t);
-    void (*set_audio_sample_callback)(retro_audio_sample_t);
-    void (*set_audio_sample_batch_callback)(retro_audio_sample_batch_t);
-    void (*set_input_poll_callback)(retro_input_poll_t);
-    void (*set_input_state_callback)(retro_input_state_t);
-    
     set_environment_callback = dlsym(core.handle, "retro_set_environment");
     set_video_refresh_callback = dlsym(core.handle, "retro_set_video_refresh");
     set_audio_sample_callback = dlsym(core.handle, "retro_set_audio_sample");
     set_audio_sample_batch_callback = dlsym(core.handle, "retro_set_audio_sample_batch");
     set_input_poll_callback = dlsym(core.handle, "retro_set_input_poll");
     set_input_state_callback = dlsym(core.handle, "retro_set_input_state");
+
+    if (!core.init || !core.deinit || !core.get_system_info || !core.get_system_av_info ||
+        !core.set_controller_port_device || !core.reset || !core.run || !core.load_game ||
+        !core.unload_game || !set_environment_callback || !set_video_refresh_callback ||
+        !set_audio_sample_callback || !set_audio_sample_batch_callback ||
+        !set_input_poll_callback || !set_input_state_callback) {
+        LOG_error("Core_open: %s is not a libretro core (missing entry points)\n", core_path);
+        dlclose(core.handle);
+        core.handle = NULL;
+        return 0;
+    }
     
     struct retro_system_info info = {};
     core.get_system_info(&info);
@@ -2561,7 +2903,8 @@ void Core_open(const char* core_path, const char* tag_name) {
     Core_getName((char*)core_path, (char*)core.name);
     sprintf((char*)core.version, "%s (%s)", info.library_name, info.library_version);
     strcpy((char*)core.tag, tag_name);
-    strcpy((char*)core.extensions, info.valid_extensions);
+    // NULL is allowed and means anything goes (the GL test cores do it)
+    strcpy((char*)core.extensions, info.valid_extensions ? info.valid_extensions : "");
     
     core.need_fullpath = info.need_fullpath;
     
@@ -2581,26 +2924,111 @@ void Core_open(const char* core_path, const char* tag_name) {
     sprintf(cmd, "mkdir -p \"%s\"; mkdir -p \"%s\"", core.config_dir, core.states_dir);
     system(cmd);
 
+    // the only one that has to happen before retro_init(); the rest wait for
+    // Core_init(), see the note above
     set_environment_callback(environment_callback);
+    return 1;
+}
+void Core_init(void) {
+    LOG_info("Core_init\n");
+    core.init();
+    core.initialized = 1;
+
     set_video_refresh_callback(video_refresh_callback);
     set_audio_sample_callback(audio_sample_callback);
     set_audio_sample_batch_callback(audio_sample_batch_callback);
     set_input_poll_callback(input_poll_callback);
     set_input_state_callback(input_state_callback);
 }
-void Core_init(void) {
-    LOG_info("Core_init\n");
-    core.init();
-    core.initialized = 1;
+static int HW_init(const struct retro_system_av_info* av_info) {
+    hwr.fbo = PLAT_hwInit(av_info->geometry.max_width, av_info->geometry.max_height,
+                          hwr.cb.depth, hwr.cb.stencil, hwr.cb.bottom_left_origin);
+    if (!hwr.fbo) return 0;
+    hwr.active = 1;
+
+    // From here on the frames come from the GPU. Re-registering is allowed at
+    // any point and RetroArch does it itself (run-ahead), so cores expect it.
+    set_video_refresh_callback(video_refresh_callback_hw);
+
+    if (hwr.cb.context_reset) hwr.cb.context_reset();
+    PLAT_hwRestoreState(); // whatever the core's setup left bound
+    return 1;
 }
-void Core_load(void) {
+static void HW_quit(void) {
+    if (!hwr.active) return;
+    // the context outlives this, so the core can still delete what it made
+    if (hwr.cb.context_destroy) hwr.cb.context_destroy();
+    PLAT_hwRestoreState();
+    PLAT_hwQuit();
+    hwr.active = 0;
+    hwr.fbo = 0;
+}
+
+// RETRO_ENVIRONMENT_GET_GAME_INFO_EXT: what RetroArch reports for the loaded content, filled by Core_load right
+// before retro_load_game() and valid until the game is unloaded. Cores use it to find files named after or next to
+// the content: Genesis Plus GX's Paprium mapper streams its music from <dir>/paprium/, for example.
+// For a zip minarch extracted itself, full_path is the extracted copy, dir the zip's folder and name the zip's
+// basename (RetroArch's convention); archive_path/archive_file name the zip and the file in it.
+
+static void GameInfoExt_fill(const char* load_path) {
+    const char* content = game.path;                      // the file the user picked (the zip, if it is one)
+    int in_archive = game.tmp_path[0] != '\0';
+    const char* slash = strrchr(content, '/');
+    const char* base = slash ? slash + 1 : content;
+    const char* dot;
+    int i;
+
+    memset(&game_info_ext, 0, sizeof(game_info_ext));
+
+    if (slash) snprintf(game_info_ext_dir, sizeof(game_info_ext_dir), "%.*s", (int)(slash - content), content);
+    else strcpy(game_info_ext_dir, ".");
+    if (!game_info_ext_dir[0]) strcpy(game_info_ext_dir, "/"); // content at the root
+
+    dot = strrchr(base, '.');
+    snprintf(game_info_ext_name, sizeof(game_info_ext_name), "%.*s", dot ? (int)(dot - base) : (int)strlen(base), base);
+
+    // the extension of the content file itself (inside the archive, if any), in lower case
+    const char* file = in_archive ? strrchr(game.tmp_path, '/') + 1 : base;
+    dot = strrchr(file, '.');
+    snprintf(game_info_ext_ext, sizeof(game_info_ext_ext), "%s", dot ? dot + 1 : "");
+    for (i = 0; game_info_ext_ext[i]; i++) game_info_ext_ext[i] = tolower((unsigned char)game_info_ext_ext[i]);
+
+    game_info_ext.full_path = load_path;
+    game_info_ext.dir = game_info_ext_dir;
+    game_info_ext.name = game_info_ext_name;
+    game_info_ext.ext = game_info_ext_ext;
+    game_info_ext.data = game.data;
+    game_info_ext.size = game.size;
+    game_info_ext.persistent_data = false; // game.data is freed by Game_close, after the core is unloaded, but cores
+                                           // that keep pointers past retro_load_game must not rely on it here
+    if (in_archive) {
+        snprintf(game_info_ext_file, sizeof(game_info_ext_file), "%s", file);
+        game_info_ext.archive_path = game.path;
+        game_info_ext.archive_file = game_info_ext_file;
+        game_info_ext.file_in_archive = true;
+    }
+    game_info_ext_ready = 1;
+}
+
+// Returns 0 if the core refused the content. Everything downstream (the av
+// info, the save ram, the state buffer) reads state that only exists once the
+// game is loaded, so this has to be checked -- ignoring it turns a core that
+// cleanly said "no" into a crash much further along.
+int Core_load(void) {
     LOG_info("Core_load\n");
     struct retro_game_info game_info;
     game_info.path = game.tmp_path[0]?game.tmp_path:game.path;
     game_info.data = game.data;
     game_info.size = game.size;
+    GameInfoExt_fill(game_info.path);
     
-    core.load_game(&game_info);
+    if (!core.load_game(&game_info)) {
+        LOG_error("Core_load: %s refused to load the content. Look further up the\n"
+                  "log for the reason it gave -- an unsupported pixel format or a\n"
+                  "missing system directory are the usual ones.\n", core.name);
+        return 0;
+    }
+    core.loaded = 1;
     
     SRAM_read();
     RTC_read();
@@ -2618,6 +3046,14 @@ void Core_load(void) {
     core.aspect_ratio = a;
     
     LOG_info("aspect_ratio: %f fps: %f\n", a, core.fps);
+
+    // A core asks for its context from retro_load_game; it gets it now that
+    // the av info says how big a frame can be, the same order as RetroArch.
+    if (hwr.requested && !HW_init(&av_info)) {
+        LOG_error("Core_load: %s needs hardware rendering and its GL context could not be set up\n", core.name);
+        return 0;
+    }
+    return 1;
 }
 void Core_reset(void) {
     core.reset();
@@ -2627,9 +3063,15 @@ void Core_unload(void) {
 }
 void Core_quit(void) {
     if (core.initialized) {
-        SRAM_write();
-        RTC_write();
-        core.unload_game();
+        // only if the content actually loaded: writing save ram the core never
+        // populated would overwrite a good .sav with whatever it hands back
+        if (core.loaded) {
+            SRAM_write();
+            RTC_write();
+            HW_quit(); // context_destroy comes before retro_unload_game, as in RetroArch
+            core.unload_game();
+            core.loaded = 0;
+        }
         core.deinit();
         core.initialized = 0;
     }
@@ -2640,15 +3082,16 @@ void Core_close(void) {
 
 ///////////////////////////////////////
 
-#define MENU_ITEM_COUNT 5
 #define MENU_SLOT_COUNT 8
 
 enum {
     ITEM_CONT,
-    ITEM_SAVE,
-    ITEM_LOAD,
+    ITEM_ACHIEVEMENTS,
+    ITEM_SAVELOAD,
     ITEM_OPTS,
     ITEM_QUIT,
+    ITEM_RESET,
+    ITEM_ID_COUNT,
 };
 
 enum {
@@ -2661,11 +3104,20 @@ enum {
     STATUS_RESET= 31,
 };
 
+// A game frame on the GPU, with where it goes: placed the way the game
+// itself is on screen (see Menu_scaleRect)
+typedef struct MenuShot {
+    GFX_Image image;
+    SDL_Rect src; // the part of the frame that shows
+    SDL_Rect dst; // and where, in the w x h it was placed for
+} MenuShot;
+
 // TODO: I don't love how overloaded this has become
 static struct {
     SDL_Surface* bitmap;
-    SDL_Surface* overlay;
-    char* items[MENU_ITEM_COUNT];
+    char* items[ITEM_ID_COUNT];
+    int rows[ITEM_ID_COUNT]; // visible row -> ITEM_*
+    int row_count;
     char* disc_paths[9]; // up to 9 paths, Arc the Lad Collection is 7 discs
     char minui_dir[256];
     char slot_path[256];
@@ -2685,27 +3137,54 @@ static struct {
     .preview_exists = 0,
     
     .items = {
-        [ITEM_CONT] = "Continue",
-        [ITEM_SAVE] = "Save",
-        [ITEM_LOAD] = "Load",
-        [ITEM_OPTS] = "Options",
-        [ITEM_QUIT] = "Quit",
+        [ITEM_CONT]         = "Continue",
+        [ITEM_ACHIEVEMENTS] = "Achievements",
+        [ITEM_SAVELOAD]     = "Save / Load",
+        [ITEM_OPTS]         = "Options",
+        [ITEM_RESET]        = "Reset",
+        [ITEM_QUIT]         = "Quit",
     }
 };
 
+// Achievements imply hardcore rules, the same way RetroAchievements does it:
+// save states are off the table. Battery saves (SRAM) are unaffected.
+static int Hardcore_active(void) {
+    return RA_isActive();
+}
+
+// The pause menu is built per game: a game with achievements gets the
+// Achievements row and loses Save / Load, anything else keeps it.
+static void Menu_buildRows(void) {
+    int n = 0;
+    menu.rows[n++] = ITEM_CONT;
+    if (RA_isActive()) menu.rows[n++] = ITEM_ACHIEVEMENTS;
+    else               menu.rows[n++] = ITEM_SAVELOAD;
+    if (!kids_mode) menu.rows[n++] = ITEM_OPTS; // scaling, filters, achievements: not for kids
+    menu.rows[n++] = ITEM_RESET;
+
+    menu.rows[n++] = ITEM_QUIT;
+
+    menu.row_count = n;
+}
+
+// Every string the menus show, in the system language. Only what's shown: the
+// frontend options keep their English values (what the config files store)
+// and the shortcuts their English names (the config's "bind" keys).
+static const int shortcut_names[SHORTCUT_COUNT] = {
+    [SHORTCUT_SAVE_STATE]  = STR_MA_SC_SAVE_STATE,
+    [SHORTCUT_LOAD_STATE]  = STR_MA_SC_LOAD_STATE,
+    [SHORTCUT_RESET_GAME]  = STR_MA_SC_RESET_GAME,
+    [SHORTCUT_CYCLE_SCALE] = STR_MA_SC_CYCLE_SCALE,
+    [SHORTCUT_TOGGLE_FF]   = STR_MA_SC_TOGGLE_FF,
+    [SHORTCUT_HOLD_FF]     = STR_MA_SC_HOLD_FF,
+};
 void Menu_init(void) {
-    menu.overlay = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_AUTO);
-    SDLX_SetAlpha(menu.overlay, SDL_SRCALPHA, 0x80);
-    SDL_FillRect(menu.overlay, NULL, 0);
-    
     char emu_name[256];
     getEmuName(game.path, emu_name);
     sprintf(menu.minui_dir, SHARED_USERDATA_PATH "/.minui/%s", emu_name);
     mkdir(menu.minui_dir, 0755);
 
     sprintf(menu.slot_path, "%s/%s.txt", menu.minui_dir, game.name);
-    
-    if (simple_mode) menu.items[ITEM_OPTS] = "Reset";
     
     if (game.m3u_path[0]) {
         char* tmp;
@@ -2742,9 +3221,12 @@ void Menu_init(void) {
     }
 }
 void Menu_quit(void) {
-    SDL_FreeSurface(menu.overlay);
 }
 void Menu_beforeSleep(void) {
+    // sleep comes from the input poll, mid-frame for a HW core, and the
+    // sleep screen is a flip: it needs the compositor's GL state, not the core's
+    if (hwr.active) PLAT_hwRestoreState();
+    GFX_showToast(0, 0, 0); // not over the "powering off" message either
     SRAM_write();
     RTC_write();
     State_autosave();
@@ -2771,6 +3253,8 @@ typedef struct MenuItem {
     char* key; // optional, used by options
     int id; // optional, used by bindings
     int value;
+    int dim;  // optional, draw in gray instead of white (eg. locked achievements)
+    int skip; // optional, not selectable (eg. a section heading)
     MenuList* submenu;
     MenuList_callback_t on_confirm;
     MenuList_callback_t on_change;
@@ -2782,23 +3266,51 @@ enum {
     MENU_FIXED, // eg. emulator
     MENU_INPUT, // eg. renders like but MENU_VAR but handles input differently
 };
+// Where the cursor was left, so a list can be reopened exactly as it was.
+typedef struct MenuPosition {
+    int row; // selected item
+    int top; // first visible item
+} MenuPosition;
+
 typedef struct MenuList {
     int type;
     int max_width; // cached on first draw
+    int jump_ends;  // optional, LEFT/RIGHT jump to the ends instead of changing values
+    int menu_exits; // optional, MENU closes the whole menu stack back to the game
+    char* title;    // optional, drawn in the pill at the top of the screen
+    char* subtitle; // optional, centered under the title; costs one visible row
+    // optional, right-aligned on the subtitle's row (so it costs no extra
+    // height) over the value column. Needs a subtitle to sit on.
+    char* subtitle_right;
+    char* subtitle_left; // optional, follows the icon on the left margin
+    int subtitle_icon;   // optional ASSET_* on the left margin, 0 for none
+    int value_nudge;  // optional, pull the value column this many px left
+    int pill_alpha;   // optional, 1..254 to make the selected row translucent
+    MenuPosition* keep; // optional, restored on entry and updated on exit
+    // optional frozen game frame to sit behind the list. PLAT_flip only draws
+    // the game texture on frames the core produced one, so with the core
+    // paused a menu has to draw the still itself or it composites over black.
+    MenuShot* backing;
     char* desc;
     MenuItem* items;
     MenuList_callback_t on_confirm;
     MenuList_callback_t on_change;
+    MenuList_callback_t on_chord; // optional, L1+R1+SELECT+START all held
 } MenuList;
 
-static int Menu_message(char* message, char** pairs) {
+// Modal prompt. Returns 1 if the user accepted with A, 0 if they backed out
+// with B. Menu_message() ignores the answer, Menu_confirm() is the guard in
+// front of anything destructive.
+static int Menu_prompt(char* message, char** pairs) {
     GFX_setMode(MODE_MAIN);
     int dirty = 1;
+    int confirmed = 0;
     while (1) {
         GFX_startFrame();
         PAD_poll();
 
-        if (PAD_justPressed(BTN_A) || PAD_justPressed(BTN_B)) break;
+        if (PAD_justPressed(BTN_A)) { confirmed = 1; break; }
+        if (PAD_justPressed(BTN_B)) break;
         
         PWR_update(&dirty, NULL, Menu_beforeSleep, Menu_afterSleep);
         
@@ -2812,7 +3324,17 @@ static int Menu_message(char* message, char** pairs) {
         else GFX_sync();
     }
     GFX_setMode(MODE_MENU);
-    return MENU_CALLBACK_NOP; // TODO: this should probably be an arg
+    return confirmed;
+}
+
+static int Menu_message(char* message, char** pairs) {
+    Menu_prompt(message, pairs);
+    return MENU_CALLBACK_NOP;
+}
+
+// B is the default here: the user has to reach for A on purpose.
+static int Menu_confirm(char* message) {
+    return Menu_prompt(message, (char*[]){ "B",(char*)T(STR_MA_CANCEL), "A",(char*)T(STR_MA_CONFIRM), NULL });
 }
 
 #define OPTION_PADDING 8
@@ -2854,7 +3376,9 @@ static int OptionFrontend_openMenu(MenuList* list, int i) {
             }
         }
 
-        OptionFrontend_menu.items = calloc(config.frontend.enabled_count+1, sizeof(MenuItem));
+        // and the NULL sentinel calloc leaves at the end
+        OptionFrontend_menu.items =
+            calloc(config.frontend.enabled_count + 1, sizeof(MenuItem));
         for (int j=0; j<config.frontend.enabled_count; j++) {
             Option* option = config.frontend.enabled_options[j];
             MenuItem* item = &OptionFrontend_menu.items[j];
@@ -2891,7 +3415,7 @@ static int OptionEmulator_optionChanged(MenuList* list, int i) {
 static int OptionEmulator_optionDetail(MenuList* list, int i) {
     MenuItem* item = &list->items[i];
     Option* option = OptionList_getOption(&config.core, item->key);
-    if (option->full) return Menu_message(option->full, (char*[]){ "B","BACK", NULL });
+    if (option->full) return Menu_message(option->full, (char*[]){ "B",(char*)T(STR_BACK), NULL });
     else return MENU_CALLBACK_NOP;
 }
 static MenuList OptionEmulator_menu = {
@@ -2943,7 +3467,7 @@ static int OptionEmulator_openMenu(MenuList* list, int i) {
         Menu_options(&OptionEmulator_menu);
     }
     else {
-        Menu_message("This core has no options.", (char*[]){ "B","BACK", NULL });
+        Menu_message((char*)T(STR_MA_NO_CORE_OPTIONS), (char*[]){ "B",(char*)T(STR_BACK), NULL });
     }
     
     return MENU_CALLBACK_NOP;
@@ -2958,21 +3482,19 @@ int OptionControls_bind(MenuList* list, int i) {
         GFX_startFrame();
         PAD_poll();
         
-        // NOTE: off by one because of the initial NONE value
-        for (int id=0; id<=LOCAL_BUTTON_COUNT; id++) {
-            if (PAD_justPressed(1 << (id-1))) {
-                item->value = id;
-                button->local = id - 1;
-                if (PAD_isPressed(BTN_MENU)) {
-                    item->value += LOCAL_BUTTON_COUNT;
-                    button->mod = 1;
-                }
-                else {
-                    button->mod = 0;
-                }
-                bound = 1;
-                break;
-            }
+        // Only the bindable buttons are listened for. MENU is strictly the
+        // modifier here: it has no label of its own, so binding it would pack
+        // an index past the end of button_labels, and it is also how the pause
+        // menu is opened. Pressing it alone simply keeps waiting.
+        for (int id=0; id<BINDABLE_BUTTON_COUNT; id++) {
+            if (!PAD_justPressed(1 << id)) continue;
+
+            button->local = id;
+            button->mod = PAD_isPressed(BTN_MENU) ? 1 : 0;
+            // +1 for the NONE entry the list starts with
+            item->value = id + 1 + (button->mod ? BINDABLE_BUTTON_COUNT : 0);
+            bound = 1;
+            break;
         }
         GFX_sync();
     }
@@ -3011,7 +3533,7 @@ static int OptionControls_openMenu(MenuList* list, int i) {
             item->name = button->name;
             item->desc = NULL;
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
             item->values = button_labels;
         }
     }
@@ -3024,7 +3546,7 @@ static int OptionControls_openMenu(MenuList* list, int i) {
             
             MenuItem* item = &OptionControls_menu.items[k++];
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
         }
     }
     Menu_options(&OptionControls_menu);
@@ -3039,21 +3561,19 @@ static int OptionShortcuts_bind(MenuList* list, int i) {
         GFX_startFrame();
         PAD_poll();
         
-        // NOTE: off by one because of the initial NONE value
-        for (int id=0; id<=LOCAL_BUTTON_COUNT; id++) {
-            if (PAD_justPressed(1 << (id-1))) {
-                item->value = id;
-                button->local = id - 1;
-                if (PAD_isPressed(BTN_MENU)) {
-                    item->value += LOCAL_BUTTON_COUNT;
-                    button->mod = 1;
-                }
-                else {
-                    button->mod = 0;
-                }
-                bound = 1;
-                break;
-            }
+        // Only the bindable buttons are listened for. MENU is strictly the
+        // modifier here: it has no label of its own, so binding it would pack
+        // an index past the end of button_labels, and it is also how the pause
+        // menu is opened. Pressing it alone simply keeps waiting.
+        for (int id=0; id<BINDABLE_BUTTON_COUNT; id++) {
+            if (!PAD_justPressed(1 << id)) continue;
+
+            button->local = id;
+            button->mod = PAD_isPressed(BTN_MENU) ? 1 : 0;
+            // +1 for the NONE entry the list starts with
+            item->value = id + 1 + (button->mod ? BINDABLE_BUTTON_COUNT : 0);
+            bound = 1;
+            break;
         }
         GFX_sync();
     }
@@ -3077,9 +3597,9 @@ static MenuList OptionShortcuts_menu = {
 };
 static char* getSaveDesc(void) {
     switch (config.loaded) {
-        case CONFIG_NONE:        return "Using defaults."; break;
-        case CONFIG_CONSOLE:    return "Using console config."; break;
-        case CONFIG_GAME:        return "Using game config."; break;
+        case CONFIG_NONE:        return (char*)T(STR_MA_USING_DEFAULTS); break;
+        case CONFIG_CONSOLE:    return (char*)T(STR_MA_USING_CONSOLE); break;
+        case CONFIG_GAME:        return (char*)T(STR_MA_USING_GAME); break;
     }
     return NULL;
 }
@@ -3091,10 +3611,10 @@ static int OptionShortcuts_openMenu(MenuList* list, int i) {
             ButtonMapping* button = &config.shortcuts[j];
             MenuItem* item = &OptionShortcuts_menu.items[j];
             item->id = j;
-            item->name = button->name;
+            item->name = (char*)T(shortcut_names[j]); // button->name is the config's key
             item->desc = NULL;
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
             item->values = button_labels;
         }
     }
@@ -3104,7 +3624,7 @@ static int OptionShortcuts_openMenu(MenuList* list, int i) {
             ButtonMapping* button = &config.shortcuts[j];
             MenuItem* item = &OptionShortcuts_menu.items[j];
             item->value = button->local + 1;
-            if (button->mod) item->value += LOCAL_BUTTON_COUNT;
+            if (button->mod) item->value += BINDABLE_BUTTON_COUNT;
         }
     }
     Menu_options(&OptionShortcuts_menu);
@@ -3117,22 +3637,22 @@ static int OptionSaveChanges_onConfirm(MenuList* list, int i) {
     switch (i) {
         case 0: {
             Config_write(CONFIG_WRITE_ALL);
-            message = "Saved for console.";
+            message = (char*)T(STR_MA_SAVED_CONSOLE);
             break;
         }
         case 1: {
             Config_write(CONFIG_WRITE_GAME);
-            message = "Saved for game.";
+            message = (char*)T(STR_MA_SAVED_GAME);
             break;
         }
         default: {
             Config_restore();
-            if (config.loaded) message = "Restored console defaults.";
-            else message = "Restored defaults.";
+            if (config.loaded) message = (char*)T(STR_MA_RESTORED_CONSOLE);
+            else message = (char*)T(STR_MA_RESTORED);
             break;
         }
     }
-    Menu_message(message, (char*[]){ "A","OKAY", NULL });
+    Menu_message(message, (char*[]){ "A",(char*)T(STR_MA_OKAY), NULL });
     OptionSaveChanges_updateDesc();
     return MENU_CALLBACK_EXIT;
 }
@@ -3297,6 +3817,28 @@ static int OptionKeyboard_openMenu(MenuList* list, int i) {
 }
 // --- FIN DE IMPLEMENTACIÓN DEL MENÚ DE TECLADO ---
 
+///////////////////////////////////////
+// achievements
+
+// The settings live in minui's Quick Menu now. What stays is erasing this
+// game's progress, behind L1+R1+SELECT+START in the Achievements List.
+static int ra_list_rebuild = 0; // the achievement list's progress was just erased: build it again
+
+static int Achievements_resetChord(MenuList* list, int i) {
+    if (!RA_isActive()) return MENU_CALLBACK_NOP; // no set loaded, nothing to erase
+
+    if (!Menu_confirm((char*)T(STR_MA_ACH_ERASE))) {
+        return MENU_CALLBACK_NOP;
+    }
+
+    RA_wipeProgress();
+    Menu_message((char*)T(STR_MA_ACH_ERASED), (char*[]){ "A",(char*)T(STR_MA_OKAY), NULL });
+    // the rows on screen still say what was earned: close the list, and
+    // Menu_achievements opens it again from the wiped data
+    ra_list_rebuild = 1;
+    return MENU_CALLBACK_EXIT;
+}
+
 static MenuList options_menu = {
     .type = MENU_LIST,
     .items = (MenuItem[]) {
@@ -3312,8 +3854,156 @@ static MenuList options_menu = {
     }
 };
 
+static void Menu_localize(void) {
+    #define TS(id) ((char*)T(id))
+    static char* onoff[3], *scaling[5], *sharpness[3], *tearing[4], *sync[3], *overclock[4], *max_ff[9];
+    onoff[0] = TS(STR_QM_OFF); onoff[1] = TS(STR_QM_ON);
+    scaling[SCALE_NATIVE] = TS(STR_MA_NATIVE); scaling[SCALE_ASPECT] = TS(STR_MA_ASPECT);
+    scaling[SCALE_FULLSCREEN] = TS(STR_MA_FULLSCREEN); scaling[SCALE_CROPPED] = TS(STR_MA_CROPPED);
+    sharpness[0] = TS(STR_MA_CRISP); sharpness[1] = TS(STR_MA_SOFT);
+    tearing[0] = TS(STR_QM_OFF); tearing[1] = TS(STR_MA_LENIENT); tearing[2] = TS(STR_MA_STRICT);
+    sync[0] = TS(STR_MA_VIDEO); sync[1] = TS(STR_MA_AUDIO);
+    overclock[0] = TS(STR_MA_POWERSAVE); overclock[1] = TS(STR_MA_NORMAL); overclock[2] = TS(STR_MA_PERFORMANCE);
+    max_ff[0] = TS(STR_MA_NONE);
+    for (int i=1; i<8; i++) max_ff[i] = max_ff_labels[i]; // 2x..8x
+
+    static const struct { int opt; int name; int desc; char** labels; } fe[] = {
+        {FE_OPT_SCALING,   STR_MA_OPT_SCALING,   STR_MA_DESC_SCALING,   scaling},
+        {FE_OPT_SHARPNESS, STR_MA_OPT_SHARPNESS, STR_MA_DESC_SHARPNESS, sharpness},
+        {FE_OPT_TEARING,   STR_MA_OPT_TEARING,   STR_MA_DESC_TEARING,   tearing},
+        {FE_OPT_SYNC,      STR_MA_OPT_SYNC,      STR_MA_DESC_SYNC,      sync},
+        {FE_OPT_OVERCLOCK, STR_MA_OPT_CPU,       STR_MA_DESC_CPU,       overclock},
+        {FE_OPT_DEBUG,     STR_MA_OPT_DEBUG,     STR_MA_DESC_DEBUG,     onoff},
+        {FE_OPT_MAXFF,     STR_MA_OPT_MAXFF,     STR_MA_DESC_MAXFF,     max_ff},
+        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_GAME, onoff},
+    };
+    for (int i=0; i<(int)(sizeof(fe)/sizeof(fe[0])); i++) {
+        Option* option = &config.frontend.options[fe[i].opt];
+        option->name = TS(fe[i].name);
+        option->desc = TS(fe[i].desc);
+        option->labels = fe[i].labels;
+    }
+
+    menu.items[ITEM_CONT]         = TS(STR_MA_CONTINUE);
+    menu.items[ITEM_ACHIEVEMENTS] = TS(STR_QM_ACHIEVEMENTS);
+    menu.items[ITEM_SAVELOAD]     = TS(STR_MA_SAVELOAD);
+    menu.items[ITEM_OPTS]         = TS(STR_MA_OPTIONS);
+    menu.items[ITEM_RESET]        = TS(STR_MA_RESET);
+    menu.items[ITEM_QUIT]         = TS(STR_MA_QUIT);
+
+    static const int options_names[] = {STR_MA_FRONTEND, STR_MA_EMULATOR, STR_MA_CONTROLS, STR_MA_SHORTCUTS, STR_MA_KEYBOARD, STR_MA_SAVE_CHANGES};
+    for (int i=0; i<6; i++) options_menu.items[i].name = TS(options_names[i]);
+    OptionSaveChanges_menu.items[0].name = TS(STR_MA_SAVE_FOR_CONSOLE);
+    OptionSaveChanges_menu.items[1].name = TS(STR_MA_SAVE_FOR_GAME);
+    OptionSaveChanges_menu.items[2].name = TS(STR_MA_RESTORE_DEFAULTS);
+
+    OptionControls_menu.desc = TS(STR_MA_DESC_BIND);
+    OptionShortcuts_menu.desc = TS(STR_MA_DESC_BIND);
+    OptionKeyboard_menu.desc = TS(STR_MA_DESC_KEYBOARD);
+    OptionKeyboard_keyMenu.desc = TS(STR_MA_DESC_KEY);
+    #undef TS
+}
+
 static void OptionSaveChanges_updateDesc(void) {
-    options_menu.items[4].desc = getSaveDesc();
+    // by callback rather than index: the Achievements row above it is dropped
+    // for games that have no set, which shifts everything after it up one
+    MenuItem* items = options_menu.items;
+    for (int i=0; items[i].name; i++) {
+        if (items[i].on_confirm != OptionSaveChanges_openMenu) continue;
+        items[i].desc = getSaveDesc();
+        break;
+    }
+}
+
+// Where a sw x sh game frame goes in a dw x dh picture of the screen (the
+// screen itself, or the half size slot preview), and which part of it shows.
+// A frame the size the game is running at gets the very rects the renderer
+// draws it with (selectScaler), scaled down with the picture, so the still
+// sits exactly where the game was. Anything else (a slot's thumbnail saved
+// at another size) is fitted whole, keeping the core's aspect ratio.
+static void Menu_scaleRect(int sw, int sh, int dw, int dh, SDL_Rect* src_rect, SDL_Rect* dst_rect) {
+    if (sw==renderer.true_w && sh==renderer.true_h && renderer.dst_w>0 && renderer.dst_h>0) {
+        int sx = renderer.src_x;
+        int sy = renderer.src_y;
+        // the forced crop draws src_w from src_x, which can run past the
+        // frame: keep to the pixels that exist
+        *src_rect = (SDL_Rect){ sx, sy, MIN(renderer.src_w, sw - sx), MIN(renderer.src_h, sh - sy) };
+        *dst_rect = (SDL_Rect){
+            renderer.dst_x * dw / DEVICE_WIDTH,
+            renderer.dst_y * dh / DEVICE_HEIGHT,
+            renderer.dst_w * dw / DEVICE_WIDTH,
+            renderer.dst_h * dh / DEVICE_HEIGHT,
+        };
+        return;
+    }
+
+    int rw, rh;
+    double fixed_aspect_ratio = ((double)DEVICE_WIDTH) / DEVICE_HEIGHT;
+    int core_aspect = core.aspect_ratio * 1000;
+    int fixed_aspect = fixed_aspect_ratio * 1000;
+    if (core_aspect>fixed_aspect) { // letterbox
+        rw = dw;
+        rh = rw / core.aspect_ratio;
+        rh += rh%2;
+    }
+    else if (core_aspect<fixed_aspect) { // pillarbox
+        rh = dh;
+        rw = rh * core.aspect_ratio;
+        rw += rw%2;
+    }
+    else {
+        rw = dw;
+        rh = dh;
+    }
+    *src_rect = (SDL_Rect){ 0, 0, sw, sh };
+    *dst_rect = (SDL_Rect){ (dw - rw) / 2, (dh - rh) / 2, rw, rh };
+}
+
+static void Menu_loadShot(MenuShot* shot, SDL_Surface* frame, int w, int h) {
+    *shot = (MenuShot){0};
+    if (!frame) return;
+    Menu_scaleRect(frame->w, frame->h, w, h, &shot->src, &shot->dst);
+    shot->image = GFX_loadImage(frame);
+}
+static void Menu_freeShot(MenuShot* shot) {
+    GFX_freeImage(&shot->image);
+}
+static void Menu_blitShot(MenuShot* shot, int x, int y) {
+    if (!shot || !shot->image.tex || shot->dst.w<=0 || shot->dst.h<=0) return;
+    GFX_blitImage(&shot->image, &shot->src, screen, &(SDL_Rect){
+        x + shot->dst.x, y + shot->dst.y, shot->dst.w, shot->dst.h
+    });
+}
+
+// What every menu sits on: the frozen game frame with the pak's overlay
+// (bezel) on it, as it looked in game, dimmed; or black. Covers the whole
+// screen, so there is nothing to clear first. The bezel is only drawn here:
+// menu.bitmap, which the save state thumbnails come from, is the raw frame.
+static void Menu_blitBackdrop(MenuShot* backing) {
+    GFX_fillRect(screen, NULL, COLOR_BLACK, 255);
+    if (!backing || !backing->image.tex) return;
+    Menu_blitShot(backing, 0, 0);
+    GFX_blitGameOverlay(screen);
+    GFX_fillRect(screen, NULL, COLOR_BLACK, 0x80);
+}
+
+#define SCROLL_WIDTH 24
+#define SCROLL_HEIGHT 4
+
+// The scroll arrows in the asset sheet are near-black (38,38,38), which is
+// invisible against these dark lists, and they're a baked sprite rather than
+// one of the tintable ASSET_COLORS, so draw them ourselves in gray.
+static void Menu_blitScrollArrow(SDL_Surface* dst, int x, int y, int up) {
+    int w = SCALE1(SCROLL_WIDTH);
+    int h = SCALE1(SCROLL_HEIGHT);
+    for (int i=0; i<h; i++) {
+        int rw = (w * (i+1)) / h;
+        GFX_fillRect(dst, &(SDL_Rect){
+            x + (w - rw) / 2,
+            y + (up ? i : h-1-i),
+            rw, 1
+        }, COLOR_GRAY, 255);
+    }
 }
 
 static int Menu_options(MenuList* list) {
@@ -3324,13 +4014,31 @@ static int Menu_options(MenuList* list) {
     int show_options = 1;
     int show_settings = 0;
     int await_input = 0;
+    int exit_to_game = 0;
+
+    // a translucent selection pill lets the frozen game show through it
+    int row_pill_alpha = (list->pill_alpha>0 && list->pill_alpha<255) ? list->pill_alpha : 255;
     
     int count;
     for (count=0; items[count].name; count++);
-    int selected = 0;
-    int start = 0;
-    int end = MIN(count,MAX_VISIBLE_OPTIONS);
-    int visible_rows = end;
+
+    // the subtitle takes vertical space from the list, so it costs a row
+    int max_rows = MAX_VISIBLE_OPTIONS - (list->subtitle ? 1 : 0);
+    int visible_rows = MIN(count,max_rows);
+
+    // pick up where we left off, if the caller is keeping track. The list can
+    // have been rebuilt since, so treat the saved spot as a hint and clamp it.
+    int selected = (list->keep && list->keep->row>0 && list->keep->row<count) ? list->keep->row : 0;
+    while (selected<count && items[selected].skip) selected++;
+    if (selected>=count) selected = 0;
+
+    int start = (list->keep && list->keep->top>0) ? list->keep->top : 0;
+    if (start>count-visible_rows) start = count - visible_rows;
+    if (selected<start) start = selected;
+    else if (selected>=start+visible_rows) start = selected - visible_rows + 1;
+    if (start<0) start = 0;
+
+    int end = MIN(count,start+visible_rows);
     
     OptionSaveChanges_updateDesc();
     
@@ -3356,56 +4064,103 @@ static int Menu_options(MenuList* list) {
         
         GFX_startFrame();
         PAD_poll();
-        
+
+        // MENU returns straight to the game rather than unwinding to the pause
+        // menu, so progress is quick to glance at mid-play. B still goes back.
+        if (list->menu_exits && BTN_WAKE!=BTN_MENU && PAD_tappedMenu(SDL_GetTicks())) {
+            exit_to_game = 1;
+            show_options = 0;
+            continue;
+        }
+
+        // a hidden combo: all four held, on the press that completes it
+        #define MENU_CHORD (BTN_L1 | BTN_R1 | BTN_SELECT | BTN_START)
+        if (list->on_chord && PAD_justPressed(MENU_CHORD) &&
+            PAD_isPressed(BTN_L1) && PAD_isPressed(BTN_R1) && PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_START)) {
+            if (list->on_chord(list, selected)==MENU_CALLBACK_EXIT) show_options = 0;
+            dirty = 1;
+            continue;
+        }
+
         if (PAD_justRepeated(BTN_UP)) {
-            selected -= 1;
-            if (selected<0) {
-                selected = count - 1;
-                start = MAX(0,count - MAX_VISIBLE_OPTIONS);
-                end = count;
-            }
-            else if (selected<start) {
-                start -= 1;
-                end -= 1;
-            }
+            int guard = count; // keep stepping over headings, but never forever
+            do {
+                selected -= 1;
+                if (selected<0) {
+                    selected = count - 1;
+                    start = MAX(0,count - max_rows);
+                    end = count;
+                }
+                else if (selected<start) {
+                    start -= 1;
+                    end -= 1;
+                }
+            } while (items[selected].skip && --guard>0);
             dirty = 1;
         }
         else if (PAD_justRepeated(BTN_DOWN)) {
-            selected += 1;
-            if (selected>=count) {
-                selected = 0;
-                start = 0;
-                end = visible_rows;
-            }
-            else if (selected>=end) {
-                start += 1;
-                end += 1;
-            }
+            int guard = count;
+            do {
+                selected += 1;
+                if (selected>=count) {
+                    selected = 0;
+                    start = 0;
+                    end = visible_rows;
+                }
+                else if (selected>=end) {
+                    start += 1;
+                    end += 1;
+                }
+            } while (items[selected].skip && --guard>0);
             dirty = 1;
         }
+        else if (list->jump_ends) {
+            // nothing to cycle through on this list, so LEFT/RIGHT jump to the
+            // ends of it instead
+            if (PAD_justRepeated(BTN_LEFT)) {
+                selected = 0;
+                while (selected<count && items[selected].skip) selected++;
+                if (selected>=count) selected = 0;
+                start = 0;
+                end = visible_rows;
+                dirty = 1;
+            }
+            else if (PAD_justRepeated(BTN_RIGHT)) {
+                selected = count - 1;
+                while (selected>0 && items[selected].skip) selected--;
+                start = MAX(0,count - max_rows);
+                end = count;
+                dirty = 1;
+            }
+        }
         else if (type!=MENU_INPUT && type!=MENU_LIST) {
+            // An action row has no value to cycle, so it must not fire
+            // on_change either - a list-level handler would be handed a row it
+            // knows nothing about.
             if (PAD_justRepeated(BTN_LEFT)) {
                 MenuItem* item = &items[selected];
-                if (item->value>0) item->value -= 1;
-                else {
-                    int j;
-                    for (j=0; item->values[j]; j++);
-                    item->value = j - 1;
+                if (item->values) {
+                    if (item->value>0) item->value -= 1;
+                    else {
+                        int j;
+                        for (j=0; item->values[j]; j++);
+                        item->value = j - 1;
+                    }
+
+                    if (item->on_change) item->on_change(list, selected);
+                    else if (list->on_change) list->on_change(list, selected);
                 }
-                
-                if (item->on_change) item->on_change(list, selected);
-                else if (list->on_change) list->on_change(list, selected);
-                
                 dirty = 1;
             }
             else if (PAD_justRepeated(BTN_RIGHT)) {
                 MenuItem* item = &items[selected];
-                if (item->values[item->value+1]) item->value += 1;
-                else item->value = 0;
-                
-                if (item->on_change) item->on_change(list, selected);
-                else if (list->on_change) list->on_change(list, selected);
-                
+                if (item->values) {
+                    if (item->values[item->value+1]) item->value += 1;
+                    else item->value = 0;
+
+                    if (item->on_change) item->on_change(list, selected);
+                    else if (list->on_change) list->on_change(list, selected);
+                }
                 dirty = 1;
             }
         }
@@ -3471,11 +4226,76 @@ static int Menu_options(MenuList* list) {
         if (defer_menu && PAD_justReleased(BTN_MENU)) defer_menu = false;
         
         if (dirty) {
-            GFX_clear(screen);
-            GFX_blitHardwareGroup(screen, show_settings);
-            
+            Menu_blitBackdrop(list->backing);
+
+            int hardware_width = GFX_blitHardwareGroup(screen, show_settings);
+
             char* desc = NULL;
-            SDL_Surface* text;
+            GFX_Text text;
+
+            if (list->title) {
+                char truncated[256];
+                int max_width = screen->w - SCALE1(PADDING * 2) - hardware_width;
+                int title_width = GFX_truncateText(font.large, list->title, truncated,
+                                                   max_width, SCALE1(BUTTON_PADDING*2));
+                max_width = MIN(max_width, title_width);
+
+                GFX_blitPill(ASSET_BLACK_PILL, screen, &(SDL_Rect){
+                    SCALE1(PADDING),
+                    SCALE1(PADDING),
+                    max_width,
+                    SCALE1(PILL_SIZE)
+                });
+                text = GFX_renderText(font.large, truncated, COLOR_WHITE);
+                GFX_blitRenderedText(&text, &(SDL_Rect){
+                    0, 0, max_width - SCALE1(BUTTON_PADDING*2), text.h
+                }, screen, SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4));
+            }
+
+            // where the rows begin: under the title pill, and under the
+            // subtitle too when there is one
+            int list_top = SCALE1(PADDING + PILL_SIZE);
+
+            if (list->subtitle) {
+                text = GFX_renderText(font.small, list->subtitle, COLOR_WHITE);
+                int sub_x = (screen->w - text.w) / 2;
+                int sub_right = sub_x + text.w;
+                int sub_h = text.h;
+
+                GFX_blitRenderedText(&text, NULL, screen, sub_x, list_top);
+
+                // the icon badges the page from the left margin, lined up with
+                // the row pills below it, and anything that follows reads as
+                // its value; the title stays centered on its own
+                int left_x = SCALE1(PADDING);
+                if (list->subtitle_icon) {
+                    GFX_blitAsset(list->subtitle_icon, NULL, screen, &(SDL_Rect){
+                        left_x,
+                        list_top + (sub_h - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                    left_x += SCALE1(RA_ICON_SIZE + 1);
+                }
+                if (list->subtitle_left) {
+                    text = GFX_renderText(font.small, list->subtitle_left, COLOR_WHITE);
+                    // as on the right, the centered title wins the row
+                    if (left_x + text.w < sub_x - SCALE1(RA_ICON_GAP)) {
+                        GFX_blitRenderedText(&text, NULL, screen, left_x, list_top);
+                    }
+                }
+
+                if (list->subtitle_right) {
+                    text = GFX_renderText(font.small, list->subtitle_right, COLOR_WHITE);
+                    // right edge of the value column, so it reads as a header
+                    // over the points rather than floating off on its own
+                    int x = screen->w - SCALE1(PADDING + OPTION_PADDING) - list->value_nudge - text.w;
+                    // a long subtitle wins the row; drop this rather than overlap
+                    if (x > sub_right + SCALE1(RA_ICON_GAP)) {
+                        GFX_blitRenderedText(&text, NULL, screen, x, list_top);
+                    }
+                }
+
+                list_top += sub_h;
+            }
 
             if (type==MENU_LIST) {
                 int mw = list->max_width;
@@ -3516,12 +4336,8 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                 }
             }
             else if (type==MENU_FIXED) {
@@ -3529,32 +4345,33 @@ static int Menu_options(MenuList* list) {
                 int mw = screen->w - SCALE1(PADDING*2);
                 // int lw,rw;
                 // lw = rw = mw / 2;
-                int ox,oy;
-                ox = oy = SCALE1(PADDING);
-                oy += SCALE1(PILL_SIZE);
+                int ox = SCALE1(PADDING);
+                int oy = list_top;
                 
                 int selected_row = selected - start;
                 for (int i=start,j=0; i<end; i++,j++) {
                     MenuItem* item = &items[i];
-                    SDL_Color text_color = COLOR_WHITE;
+                    SDL_Color text_color = item->dim ? COLOR_GRAY : COLOR_WHITE;
 
                     if (j==selected_row) {
                         // gray pill
-                        GFX_blitPill(ASSET_OPTION, screen, &(SDL_Rect){
+                        GFX_blitPillAlpha(ASSET_OPTION, screen, &(SDL_Rect){
                             ox,
                             oy+SCALE1(j*BUTTON_SIZE),
                             mw,
                             SCALE1(BUTTON_SIZE)
-                        });
+                        }, row_pill_alpha);
                     }
                     
-                    if (item->value>=0) {
-                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value], COLOR_WHITE); // always white
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            ox + mw - text->w - SCALE1(OPTION_PADDING),
-                            oy+SCALE1((j*BUTTON_SIZE)+3)
-                        });
-                        SDL_FreeSurface(text);
+                    if (item->value>=0 && item->values && item->values[item->value]) {
+                        text = GFX_renderText(font.tiny, item->values[item->value],
+                                              item->dim ? COLOR_GRAY : COLOR_WHITE);
+                        // value_nudge pulls this column toward the name. Only
+                        // the value moves, so headings (which have no value)
+                        // keep their position exactly.
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            ox + mw - text.w - SCALE1(OPTION_PADDING) - list->value_nudge,
+                            oy+SCALE1((j*BUTTON_SIZE)+3));
                     }
                     
                     // TODO: blit a black pill on unselected rows (to cover longer item->values?) or truncate longer item->values?
@@ -3573,12 +4390,8 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                 }
             }
             else if (type==MENU_VAR || type==MENU_INPUT) {
@@ -3595,7 +4408,12 @@ static int Menu_options(MenuList* list) {
                         
                         // every value list in an input table is the same
                         // so only calculate rw for the first item...
-                        if (!mrw || type!=MENU_INPUT) {
+                        // a row with no values is a drill-down, not an option,
+                        // and contributes only its own name to the width
+                        if (!item->values) {
+                            w = lw;
+                        }
+                        else if (!mrw || type!=MENU_INPUT) {
                             for (int j=0; item->values[j]; j++) {
                                 TTF_SizeUTF8(font.tiny, item->values[j], &rw, NULL);
                                 if (lw+rw>w) w = lw+rw;
@@ -3643,34 +4461,26 @@ static int Menu_options(MenuList* list) {
                         
                         if (item->desc) desc = item->desc;
                     }
-                    text = TTF_RenderUTF8_Blended(font.small, item->name, text_color);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                        ox+SCALE1(OPTION_PADDING),
-                        oy+SCALE1((j*BUTTON_SIZE)+1)
-                    });
-                    SDL_FreeSurface(text);
+                    text = GFX_renderText(font.small, item->name, text_color);
+                    GFX_blitRenderedText(&text, NULL, screen, ox+SCALE1(OPTION_PADDING), oy+SCALE1((j*BUTTON_SIZE)+1));
                     
                     if (await_input && j==selected_row) {
                         // buh
                     }
-                    else if (item->value>=0) {
-                        text = TTF_RenderUTF8_Blended(font.tiny, item->values[item->value], COLOR_WHITE); // always white
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            ox + mw - text->w - SCALE1(OPTION_PADDING),
-                            oy+SCALE1((j*BUTTON_SIZE)+3)
-                        });
-                        SDL_FreeSurface(text);
+                    else if (item->value>=0 && item->values && item->values[item->value]) {
+                        text = GFX_renderText(font.tiny, item->values[item->value], COLOR_WHITE); // always white
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            ox + mw - text.w - SCALE1(OPTION_PADDING),
+                            oy+SCALE1((j*BUTTON_SIZE)+3));
                     }
                 }
             }
             
-            if (count>MAX_VISIBLE_OPTIONS) {
-                #define SCROLL_WIDTH 24
-                #define SCROLL_HEIGHT 4
+            if (count>max_rows) {
                 int ox = (screen->w - SCALE1(SCROLL_WIDTH))/2;
                 int oy = SCALE1((PILL_SIZE - SCROLL_HEIGHT) / 2);
-                if (start>0) GFX_blitAsset(ASSET_SCROLL_UP,   NULL, screen, &(SDL_Rect){ox, SCALE1(PADDING) + oy});
-                if (end<count) GFX_blitAsset(ASSET_SCROLL_DOWN, NULL, screen, &(SDL_Rect){ox, screen->h - SCALE1(PADDING + PILL_SIZE + BUTTON_SIZE) + oy});
+                if (start>0) Menu_blitScrollArrow(screen, ox, SCALE1(PADDING) + oy, 1);
+                if (end<count) Menu_blitScrollArrow(screen, ox, screen->h - SCALE1(PADDING + PILL_SIZE + BUTTON_SIZE) + oy, 0);
             }
             
             if (!desc && list->desc) desc = list->desc;
@@ -3691,146 +4501,207 @@ static int Menu_options(MenuList* list) {
         else GFX_sync();
     }
     
-    // GFX_clearAll();
-    // GFX_flip(screen);
-    
-    return 0;
+    if (list->keep) {
+        list->keep->row = selected;
+        list->keep->top = start;
+    }
+
+    // MENU_CALLBACK_EXIT also unwinds a parent Menu_options, which is what we
+    // want: the whole stack closes and the caller resumes the game.
+    return exit_to_game ? MENU_CALLBACK_EXIT : 0;
 }
 
-static void Menu_scale(SDL_Surface* src, SDL_Surface* dst) {
-    // LOG_info("Menu_scale src: %ix%i dst: %ix%i\n", src->w,src->h,dst->w,dst->h);
-    
-    uint16_t* s = src->pixels;
-    uint16_t* d = dst->pixels;
+///////////////////////////////////////
+// achievements
+//
+// Read-only view over the base set, grouped under "--- locked ---" and
+// "--- unlocked ---" headings: still-locked achievements (gray) first, earned
+// ones (white) at the bottom. Achievements that count something show their
+// progress instead of their points. Leaderboards and rich presence are
+// deliberately not part of this.
 
-    int sw = src->w;
-    int sh = src->h;
-    int sp = src->pitch / FIXED_BPP;
-    
-    int dw = dst->w;
-    int dh = dst->h;
-    int dp = dst->pitch / FIXED_BPP;
-    
-    int rx = 0;
-    int ry = 0;
-    int rw = dw;
-    int rh = dh;
-    
-    int scaling = screen_scaling;
-    if (scaling==SCALE_CROPPED && DEVICE_WIDTH==HDMI_WIDTH) {
-        scaling = SCALE_NATIVE;
-    }
-    if (scaling==SCALE_NATIVE) {
-        // LOG_info("native\n");
-        
-        rx = renderer.dst_x;
-        ry = renderer.dst_y;
-        rw = renderer.src_w;
-        rh = renderer.src_h;
-        if (renderer.scale) {
-            // LOG_info("scale: %i\n", renderer.scale);
-            rw *= renderer.scale;
-            rh *= renderer.scale;
-        }
-        else {
-            // LOG_info("forced crop\n"); // eg. fc on nano, vb on smart
-            rw -= renderer.src_x * 2;
-            rh -= renderer.src_y * 2;
-            sw = rw;
-            sh = rh;
-        }
-        
-        if (dw==DEVICE_WIDTH/2) {
-            // LOG_info("halve\n");
-            rx /= 2;
-            ry /= 2;
-            rw /= 2;
-            rh /= 2;
-        }
-    }
-    else if (scaling==SCALE_CROPPED) {
-        // LOG_info("cropped\n");
-        sw -= renderer.src_x * 2;
-        sh -= renderer.src_y * 2;
+#define RA_STATUS_SIZE 16
+#define RA_BULLET "+" // U+2022; the UI font has no check mark
+#define RA_DESC_LINES 3 // descriptions wrap onto at most this many lines
+#define RA_VALUE_NUDGE 5  // logical px to pull the points column toward the name
+#define RA_PILL_ALPHA  200 // alpha so the frozen game shows through the selection
 
-        rx = renderer.dst_x;
-        ry = renderer.dst_y;
-        rw = sw * renderer.scale;
-        rh = sh * renderer.scale;
-        
-        if (dw==DEVICE_WIDTH/2) {
-            // LOG_info("halve\n");
-            rx /= 2;
-            ry /= 2;
-            rw /= 2;
-            rh /= 2;
-        }
-    }
-    
-    if (scaling==SCALE_ASPECT || rw>dw || rh>dh) {
-        // LOG_info("aspect\n");
-        double fixed_aspect_ratio = ((double)DEVICE_WIDTH) / DEVICE_HEIGHT;
-        int core_aspect = core.aspect_ratio * 1000;
-        int fixed_aspect = fixed_aspect_ratio * 1000;
-        
-        if (core_aspect>fixed_aspect) {
-            // LOG_info("letterbox\n");
-            rw = dw;
-            rh = rw / core.aspect_ratio;
-            rh += rh%2;
-        }
-        else if (core_aspect<fixed_aspect) {
-            // LOG_info("pillarbox\n");
-            rh = dh;
-            rw = rh * core.aspect_ratio;
-            rw += rw%2;
-            rw = (rw/8)*8; // probably necessary here since we're not scaling by an integer
-        }
-        else {
-            // LOG_info("perfect match\n");
-            rw = dw;
-            rh = dh;
-        }
-        
-        rx = (dw - rw) / 2;
-        ry = (dh - rh) / 2;
-    }
-    
-    // LOG_info("Menu_scale (r): %i,%i %ix%i\n",rx,ry,rw,rh);
-    // LOG_info("offset: %i,%i\n", renderer.src_x, renderer.src_y);
+// Where the player was in the list, and whether they left it with MENU. If
+// they did, the next MENU press drops them straight back in at the same spot
+// instead of making them walk the pause menu again.
+static MenuPosition ra_list_pos = {0};
+static int ra_list_resume = 0;
 
-    // dumb nearest neighbor scaling
-    int mx = (sw << 16) / rw;
-    int my = (sh << 16) / rh;
-    int ox = (renderer.src_x << 16);
-    int sx = ox;
-    int sy = (renderer.src_y << 16);
-    int lr = -1;
-    int sr = 0;
-    int dr = ry * dp;
-    int cp = dp * FIXED_BPP;
-    
-    // LOG_info("Menu_scale (s): %i,%i %ix%i\n",sx,sy,sw,sh);
-    // LOG_info("mx:%i my:%i sx>>16:%i sy>>16:%i\n",mx,my,((sx+mx) >> 16),((sy+my) >> 16));
+#define RA_SUMMARY_SIZE 32
 
-        for (int dy=0; dy<rh; dy++) {
-            sx = ox;
-            sr = (sy >> 16) * sp;
-            if (sr==lr) {
-                memcpy(d+dr,d+dr-dp,cp);
+// "250 - 5/10" - points earned, then the count. The trophy drawn beside it is
+// the unit, so the score carries no suffix.
+static void Menu_achievementSummary(char* out, size_t size) {
+    uint32_t unlocked = 0, total = 0, points = 0;
+    RA_getSummary(&unlocked, &total, &points);
+    snprintf(out, size, "%u   %u/%u", points, unlocked, total);
+}
+
+// Returns MENU_CALLBACK_EXIT if the user asked to go straight back to the game.
+// `backing` is the pause menu's frozen game frame, shown behind the list the
+// same way the Save / Load submenu does it.
+static int Menu_achievements(MenuShot* backing) {
+    int count = RA_getAchievementCount();
+    if (count<=0) return 0;
+
+    RA_refreshProgress();
+
+    // both live until Menu_options() returns, which is all the list needs:
+    // the score badges the left margin next to the trophy, the tally sits on
+    // the right. No percentage -- the two numbers already say it.
+    char ra_points[RA_SUMMARY_SIZE];
+    char ra_tally[RA_SUMMARY_SIZE];
+    {
+        uint32_t unlocked = 0, total = 0, points = 0;
+        RA_getSummary(&unlocked, &total, &points);
+        snprintf(ra_points, sizeof(ra_points), "%u", points);
+        snprintf(ra_tally, sizeof(ra_tally), "%u/%u", unlocked, total);
+    }
+
+    // GFX_wrapText rewrites the string in place, so it needs our own copies
+    // rather than the descriptions ra_offline owns. Wrapping only ever swaps a
+    // space for a newline, so a same-length copy is enough.
+    size_t desc_bytes = 1;
+    for (int i=0; i<count; i++) {
+        const RA_Achievement* ach = RA_getAchievement(i);
+        desc_bytes += (ach && ach->description ? strlen(ach->description) : 0) + 1;
+    }
+
+    // two headings at most, plus the rows, plus the NULL terminator
+    MenuItem* items  = calloc(count + 3, sizeof(MenuItem));
+    char*     status = calloc(count, RA_STATUS_SIZE);
+    char**    values = calloc(count * 2, sizeof(char*));
+    char*     descs  = malloc(desc_bytes);
+    if (!items || !status || !values || !descs) {
+        free(items); free(status); free(values); free(descs);
+        return 0;
+    }
+
+    // the description is centered under the list, so keep a margin either side
+    int desc_width = screen->w - SCALE1(PADDING * 2);
+    char* desc_cursor = descs;
+
+    int n = 0;    // rows written
+    int slot = 0; // status/values slots used (headings have none)
+
+    // still-locked first, earned at the bottom
+    for (int pass=0; pass<2; pass++) {
+        int heading = 0;
+        for (int i=0; i<count; i++) {
+            const RA_Achievement* ach = RA_getAchievement(i);
+            if (!ach || !!ach->unlocked != pass) continue;
+
+            if (!heading) { // only when the group turns out to be non-empty
+                heading = 1;
+                items[n].name = (char*)T(pass ? STR_MA_ACH_UNLOCKED : STR_MA_ACH_LOCKED);
+                items[n].dim  = 1;
+                items[n].skip = 1;
+                n++;
             }
-            else {
-                for (int dx=0; dx<rw; dx++) {
-                    d[dr + rx + dx] = s[sr + (sx >> 16)];
-                    sx += mx;
-                }
+
+            char* text = status + slot * RA_STATUS_SIZE;
+            if (ach->unlocked)
+                snprintf(text, RA_STATUS_SIZE, RA_BULLET " %u", ach->points);
+            else if (ach->progress[0]) // eg. "12/76" for a counted achievement
+                snprintf(text, RA_STATUS_SIZE, "%s", ach->progress);
+            else
+                snprintf(text, RA_STATUS_SIZE, "%u", ach->points);
+
+            values[slot*2 + 0] = text;
+            values[slot*2 + 1] = NULL;
+
+            char* desc = desc_cursor;
+            const char* src = ach->description ? ach->description : "";
+            size_t len = strlen(src);
+            memcpy(desc, src, len);
+            desc[len] = '\0';
+            desc_cursor += len + 1;
+            // Wrap freely rather than passing RA_DESC_LINES: GFX_wrapText stops
+            // inserting breaks once it reaches its cap and leaves the whole
+            // remaining tail on one over-wide line. Cut it ourselves instead.
+            GFX_wrapText(font.tiny, desc, desc_width, 0);
+
+            char* at = desc;
+            char* last_line = desc;
+            char* cut = NULL;
+            for (int kept=1; kept<=RA_DESC_LINES; kept++) {
+                char* nl = strchr(at, '\n');
+                if (!nl) break;
+                if (kept==RA_DESC_LINES) { last_line = at; cut = nl; }
+                at = nl + 1;
             }
-            lr = sr;
-            sy += my;
-            dr += dp;
+            if (cut) { // there was a line we're dropping, so mark the elision
+                if (cut - last_line >= 3) memcpy(cut - 3, "...", 3);
+                *cut = '\0';
+            }
+
+            items[n].name   = (char*)ach->title;
+            items[n].desc   = desc;
+            items[n].values = &values[slot*2];
+            items[n].value  = 0;
+            items[n].dim    = !ach->unlocked; // gray while locked, white once earned
+            n++;
+            slot++;
         }
-    
-    // LOG_info("successful\n");
+    }
+    items[n].name = NULL;
+
+    MenuList list = {
+        .type = MENU_FIXED,
+        .jump_ends = 1,  // RIGHT jumps to the top, LEFT to the bottom
+        .menu_exits = 1, // MENU goes straight back to the game
+        .subtitle = (char*)T(STR_MA_ACH_LIST),
+        .subtitle_icon = ASSET_TROPHY,
+        .subtitle_left = ra_points,
+        .subtitle_right = ra_tally,
+        .value_nudge = SCALE1(RA_VALUE_NUDGE),
+        .pill_alpha = RA_PILL_ALPHA,
+        .keep = &ra_list_pos,
+        .backing = backing,
+        .on_chord = Achievements_resetChord, // erase this game's progress
+        .desc = NULL,
+        .items = items,
+    };
+    int result = Menu_options(&list);
+
+    free(items);
+    free(status);
+    free(values);
+    free(descs);
+
+    // erased from inside the list: straight back into a fresh one, from the
+    // top (every row has moved to the locked group)
+    if (ra_list_rebuild) {
+        ra_list_rebuild = 0;
+        ra_list_pos = (MenuPosition){0};
+        return Menu_achievements(backing);
+    }
+    return result;
+}
+
+// Opens the list and records how it was left. Returns 1 if the player asked to
+// go back to the game (MENU), 0 if they just backed out of the list (B).
+static int Menu_achievementsVisit(MenuShot* backing) {
+    ra_list_resume = (Menu_achievements(backing)==MENU_CALLBACK_EXIT);
+    return ra_list_resume;
+}
+
+// Hashing the rom and parsing the set; also used when achievements are turned
+// back on mid-session, which is why it isn't inline in main().
+static void RA_loadForGame(void) {
+    RA_init(RETROACHIVEMENTS_PATH);
+    // RA_init zeroes the context, so these go in after it rather than through
+    // Config_syncFrontend, which runs while reading the config - before this
+    RA_setChime(achievement_sound);
+    RA_setNotify(achievement_notify);
+    RA_setMemoryFuncs(core.get_memory_data, core.get_memory_size);
+    RA_setGamePath(game.m3u_path[0] ? game.m3u_path : game.path, SDCARD_PATH);
+    RA_loadGame((char*)core.tag, game.tmp_path[0]?game.tmp_path:game.path, game.data, game.size);
 }
 
 static void Menu_initState(void) {
@@ -3842,6 +4713,9 @@ static void Menu_initState(void) {
 }
 static void Menu_updateState(void) {
     // LOG_info("Menu_updateState\n");
+
+    // the exists() checks below have to see any save still being written
+    IO_flush();
 
     int last_slot = state_slot;
     state_slot = menu.slot;
@@ -3860,6 +4734,31 @@ static void Menu_updateState(void) {
     // LOG_info("save_path: %s (%i)\n", save_path, menu.save_exists);
     // LOG_info("bmp_path: %s txt_path: %s (%i)\n", menu.bmp_path, menu.txt_path, menu.preview_exists);
 }
+// The core's framebuffer as an RGB565 surface, for the menu's backdrop and
+// the slot thumbnails. A 32-bit core gets converted once here rather than
+// teaching every consumer two formats -- it only ever runs on pause or on a
+// save, never per frame.
+static SDL_Surface* Menu_gameFrame(void) {
+    // a hardware frame only exists on the GPU: read back a copy (~40ms)
+    if (hwr.active && !hwr.sw_frame) return PLAT_hwCapture(renderer.true_w, renderer.true_h);
+    if (!renderer.src) return NULL;
+
+    if (core_pixel_bpp!=4) {
+        return SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
+            FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+    }
+
+    // XRGB8888 is B,G,R,X in memory on little endian
+    SDL_Surface* raw = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h,
+                                                32, renderer.src_p,
+                                                0x00FF0000, 0x0000FF00, 0x000000FF, 0);
+    if (!raw) return NULL;
+
+    SDL_Surface* out = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGB565, 0);
+    SDL_FreeSurface(raw);
+    return out;
+}
+
 static void Menu_saveState(void) {
     // LOG_info("Menu_saveState\n");
 
@@ -3874,17 +4773,25 @@ static void Menu_saveState(void) {
     SDL_Surface* temp_surface = NULL;
 
     if (!bitmap) {
-        temp_surface = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h, FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+        temp_surface = Menu_gameFrame();
         bitmap = temp_surface;
     }
 
     if (bitmap) {
-        SDL_RWops* out = SDL_RWFromFile(menu.bmp_path, "wb");
-        if (out) {
-            SDL_SaveBMP_RW(bitmap, out, 1);
+        // Encoded into memory and written by the IO thread with the state.
+        // Room for the worst case SDL writes: 32bpp plus the largest header.
+        size_t cap = 2048 + (size_t)bitmap->w * bitmap->h * 4 + (size_t)bitmap->h * 4;
+        void* bmp = malloc(cap);
+        SDL_RWops* out = bmp ? SDL_RWFromMem(bmp, (int)cap) : NULL;
+        if (out && SDL_SaveBMP_RW(bitmap, out, 0)==0) {
+            size_t bmp_size = (size_t)SDL_RWtell(out);
+            SDL_RWclose(out);
+            IO_writeFile(menu.bmp_path, bmp, bmp_size);
             LOG_info("BMP: %s %ix%i\n", menu.bmp_path, bitmap->w,bitmap->h);
         } else {
-            LOG_error("Failed to open %s for writing\n", menu.bmp_path);
+            if (out) SDL_RWclose(out);
+            free(bmp);
+            LOG_error("Failed to encode %s\n", menu.bmp_path);
         }
     }
 
@@ -3920,19 +4827,219 @@ static void Menu_loadState(void) {
     State_read();
 }
 
+///////////////////////////////////////
+// save / load submenu
+
+// Decode the active slot's thumbnail into `preview`, a half size picture of
+// the screen. IMG_Load is a full decode plus an upload, so this belongs on
+// slot changes only - it used to run on every repaint, which is what made
+// the submenu feel heavy to navigate.
+static void Menu_loadSlotPreview(MenuShot* preview) {
+    Menu_freeShot(preview);
+    if (!menu.preview_exists) return;
+
+    SDL_Surface* bmp = IMG_Load(menu.bmp_path);
+    if (!bmp) return; // leave the slot blank rather than show the last one's shot
+
+    Menu_loadShot(preview, bmp, DEVICE_WIDTH/2, DEVICE_HEIGHT/2);
+    SDL_FreeSurface(bmp);
+}
+
+// The slot thumbnail, pagination dots and all. Lifted out of the pause menu
+// unchanged - the Save / Load submenu owns it now.
+static void Menu_blitSlotPreview(MenuShot* preview) {
+    #define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
+    #define PAGINATION_HEIGHT 6
+    // unscaled
+    int hw = DEVICE_WIDTH / 2;
+    int hh = DEVICE_HEIGHT / 2;
+    int pw = hw + SCALE1(WINDOW_RADIUS*2);
+    int ph = hh + SCALE1(WINDOW_RADIUS*2 + PAGINATION_HEIGHT + WINDOW_RADIUS);
+    int ox = DEVICE_WIDTH - pw - SCALE1(PADDING);
+    int oy = (DEVICE_HEIGHT - ph) / 2;
+
+    // window
+    GFX_blitRect(ASSET_STATE_BG, screen, &(SDL_Rect){ox,oy,pw,ph});
+    ox += SCALE1(WINDOW_RADIUS);
+    oy += SCALE1(WINDOW_RADIUS);
+
+    SDL_Rect preview_rect = {ox,oy,hw,hh};
+    GFX_fillRect(screen, &preview_rect, COLOR_BLACK, 255);
+    if (menu.preview_exists && preview && preview->image.tex) { // has save, has preview
+        // already decoded by Menu_loadSlotPreview, so this is just a draw
+        Menu_blitShot(preview, ox, oy);
+    }
+    else {
+        if (menu.save_exists) GFX_blitMessage(font.large, (char*)T(STR_MA_NO_PREVIEW), screen, &preview_rect);
+        else GFX_blitMessage(font.large, (char*)T(STR_MA_EMPTY_SLOT), screen, &preview_rect);
+    }
+
+    // pagination
+    ox += (pw-SCALE1(15*MENU_SLOT_COUNT))/2;
+    oy += hh+SCALE1(WINDOW_RADIUS);
+    for (int i=0; i<MENU_SLOT_COUNT; i++) {
+        if (i==menu.slot) GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15),oy});
+        else GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15)+4,oy+SCALE1(2)});
+    }
+}
+
+enum {
+    SAVELOAD_SAVE,
+    SAVELOAD_LOAD,
+    SAVELOAD_BACK,
+    SAVELOAD_COUNT,
+};
+
+// Slots are 0-based on disk (<game>.st0 .. .st7); show them 1-based.
+static void Menu_saveLoadLabels(char labels[SAVELOAD_COUNT][32]) {
+    snprintf(labels[SAVELOAD_SAVE], 32, T(STR_MA_SAVE_SLOT), menu.slot + 1);
+    snprintf(labels[SAVELOAD_LOAD], 32, T(STR_MA_LOAD_SLOT), menu.slot + 1);
+    snprintf(labels[SAVELOAD_BACK], 32, "%s", T(STR_MA_BACK_ROW));
+}
+
+// Everything that depends on which slot is active. Called on entry and when
+// LEFT/RIGHT moves the slot - never per frame.
+static void Menu_slotChanged(MenuShot* preview, char labels[SAVELOAD_COUNT][32]) {
+    Menu_updateState();        // save_exists / preview_exists / paths
+    Menu_loadSlotPreview(preview);
+    Menu_saveLoadLabels(labels);
+}
+
+// Returns the STATUS_* the pause menu should adopt and close on, or -1 to stay
+// open. `backing` is the pause menu's dimmed game shot, reused so the two
+// screens look like one.
+static int Menu_saveLoad(MenuShot* backing) {
+    char labels[SAVELOAD_COUNT][32];
+    MenuShot preview_shot = {0};
+    MenuShot* preview = &preview_shot;
+
+    int selected = 0;
+    int dirty = 1;
+    int show_setting = 0;
+    int result = -1;
+    int running = 1;
+
+    Menu_slotChanged(preview, labels);
+
+    while (running) {
+        GFX_startFrame();
+        PAD_poll();
+
+        if (PAD_justPressed(BTN_UP)) {
+            selected -= 1;
+            if (selected<0) selected += SAVELOAD_COUNT;
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_DOWN)) {
+            selected += 1;
+            if (selected>=SAVELOAD_COUNT) selected -= SAVELOAD_COUNT;
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_LEFT)) {
+            menu.slot -= 1;
+            if (menu.slot<0) menu.slot += MENU_SLOT_COUNT;
+            Menu_slotChanged(preview, labels);
+            dirty = 1;
+        }
+        else if (PAD_justPressed(BTN_RIGHT)) {
+            menu.slot += 1;
+            if (menu.slot>=MENU_SLOT_COUNT) menu.slot -= MENU_SLOT_COUNT;
+            Menu_slotChanged(preview, labels);
+            dirty = 1;
+        }
+
+        if (PAD_justPressed(BTN_B)) {
+            running = 0; // same as picking Back
+        }
+        else if (PAD_justPressed(BTN_A)) {
+            switch (selected) {
+                case SAVELOAD_SAVE:
+                    Menu_saveState();
+                    result = STATUS_SAVE;
+                    running = 0;
+                break;
+                case SAVELOAD_LOAD:
+                    Menu_loadState();
+                    result = STATUS_LOAD;
+                    running = 0;
+                break;
+                case SAVELOAD_BACK:
+                    running = 0;
+                break;
+            }
+        }
+
+        PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
+
+        if (dirty) {
+            Menu_blitBackdrop(backing);
+
+            GFX_Text text;
+
+            if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
+            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU",(char*)T(STR_SLEEP), NULL }, 0, screen, 0);
+            GFX_blitButtonGroup((char*[]){ "B",(char*)T(STR_BACK), "A",(char*)T(STR_MA_OKAY), NULL }, 1, screen, 1);
+
+            // rows, drawn like the pause menu's
+            int oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (SAVELOAD_COUNT * PILL_SIZE)) / 2;
+            for (int i=0; i<SAVELOAD_COUNT; i++) {
+                char* item = labels[i];
+                SDL_Color text_color = COLOR_WHITE;
+
+                if (i==selected) {
+                    int pill_width = 0;
+                    TTF_SizeUTF8(font.large, item, &pill_width, NULL);
+                    pill_width += SCALE1(BUTTON_PADDING*2);
+
+                    GFX_blitPill(ASSET_WHITE_PILL, screen, &(SDL_Rect){
+                        SCALE1(PADDING),
+                        SCALE1(oy + PADDING + (i * PILL_SIZE)),
+                        pill_width,
+                        SCALE1(PILL_SIZE)
+                    });
+                    text_color = COLOR_BLACK;
+                }
+                else {
+                    // shadow
+                    text = GFX_renderText(font.large, item, COLOR_BLACK);
+                    GFX_blitRenderedText(&text, NULL, screen,
+                        SCALE1(2 + PADDING + BUTTON_PADDING),
+                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4));
+                }
+
+                text = GFX_renderText(font.large, item, text_color);
+                GFX_blitRenderedText(&text, NULL, screen,
+                    SCALE1(PADDING + BUTTON_PADDING),
+                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4));
+            }
+
+            Menu_blitSlotPreview(preview);
+
+            GFX_flip(screen);
+            dirty = 0;
+        }
+        else GFX_sync();
+    }
+
+    Menu_freeShot(preview);
+    PAD_reset(); // don't let the A/B that left this screen leak upstream
+    return result;
+}
+
 static void Menu_loop(void) {
-    menu.bitmap = SDL_CreateRGBSurfaceFrom(renderer.src, renderer.true_w, renderer.true_h, FIXED_DEPTH, renderer.src_p, RGBA_MASK_565);
+    // the core may have kept drawing after its last frame went out
+    if (hwr.active) PLAT_hwRestoreState();
+
+    menu.bitmap = Menu_gameFrame();
     //LOG_info("Menu_loop:menu.bitmap %ix%i\n", menu.bitmap->w,menu.bitmap->h);
     
-    SDL_Surface* backing = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH,DEVICE_HEIGHT,FIXED_DEPTH,RGBA_MASK_565); 
-    Menu_scale(menu.bitmap, backing);
-    
-    int restore_w = screen->w;
-    int restore_h = screen->h;
-    int restore_p = screen->pitch;
-    if (restore_w!=DEVICE_WIDTH || restore_h!=DEVICE_HEIGHT) {
-        screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
-    }
+    // the frozen frame every menu screen sits on, on the GPU
+    MenuShot backing_shot;
+    MenuShot* backing = &backing_shot;
+    Menu_loadShot(backing, menu.bitmap, DEVICE_WIDTH, DEVICE_HEIGHT);
+
+    GFX_setUILayer(1); // the menu *is* the ui layer
+    GFX_showToast(0, 0, 0); // and it would be drawn over the menu
     // sky: removed
     //SRAM_write();
     RTC_write();
@@ -3961,12 +5068,14 @@ static void Menu_loop(void) {
     getDisplayName(game.name, rom_name);
     
     int rom_disc = -1;
-    char disc_name[16];
+    char disc_name[32];
     if (menu.total_discs) {
         rom_disc = menu.disc;
-        sprintf(disc_name, "Disc %i", menu.disc+1);
+        snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
     }
         
+    Menu_buildRows();
+
     int selected = 0; // resets every launch
     Menu_initState();
     
@@ -3976,61 +5085,61 @@ static void Menu_loop(void) {
     int ignore_menu = 0;
     int menu_start = 0;
     
-    SDL_Surface* preview = SDL_CreateRGBSurface(SDL_SWSURFACE,DEVICE_WIDTH/2,DEVICE_HEIGHT/2,FIXED_DEPTH,RGBA_MASK_565); // TODO: retain until changed?
-    
+    // The player left the achievements list with MENU last time, so put them
+    // back in it rather than making them find it again. MENU again returns to
+    // the game and keeps the spot; B drops through to the pause menu below.
+    if (ra_list_resume && RA_isActive()) {
+        if (Menu_achievementsVisit(backing)) {
+            status = STATUS_CONT;
+            show_menu = 0;
+        }
+        else dirty = 1;
+    }
+
     while (show_menu) {
         GFX_startFrame();
         uint32_t now = SDL_GetTicks();
 
         PAD_poll();
         
+        int item_id = menu.rows[selected];
+
         if (PAD_justPressed(BTN_UP)) {
             selected -= 1;
-            if (selected<0) selected += MENU_ITEM_COUNT;
+            if (selected<0) selected += menu.row_count;
             dirty = 1;
         }
         else if (PAD_justPressed(BTN_DOWN)) {
             selected += 1;
-            if (selected>=MENU_ITEM_COUNT) selected -= MENU_ITEM_COUNT;
+            if (selected>=menu.row_count) selected -= menu.row_count;
             dirty = 1;
         }
         else if (PAD_justPressed(BTN_LEFT)) {
-            if (menu.total_discs>1 && selected==ITEM_CONT) {
+            if (menu.total_discs>1 && item_id==ITEM_CONT) {
                 menu.disc -= 1;
                 if (menu.disc<0) menu.disc += menu.total_discs;
                 dirty = 1;
-                sprintf(disc_name, "Disc %i", menu.disc+1);
-            }
-            else if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                menu.slot -= 1;
-                if (menu.slot<0) menu.slot += MENU_SLOT_COUNT;
-                dirty = 1;
+                snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
             }
         }
         else if (PAD_justPressed(BTN_RIGHT)) {
-            if (menu.total_discs>1 && selected==ITEM_CONT) {
+            if (menu.total_discs>1 && item_id==ITEM_CONT) {
                 menu.disc += 1;
                 if (menu.disc==menu.total_discs) menu.disc -= menu.total_discs;
                 dirty = 1;
-                sprintf(disc_name, "Disc %i", menu.disc+1);
-            }
-            else if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                menu.slot += 1;
-                if (menu.slot>=MENU_SLOT_COUNT) menu.slot -= MENU_SLOT_COUNT;
-                dirty = 1;
+                snprintf(disc_name, sizeof(disc_name), T(STR_MA_DISC), menu.disc+1);
             }
         }
-        
-        if (dirty && (selected==ITEM_SAVE || selected==ITEM_LOAD)) {
-            Menu_updateState();
-        }
+
+        // the row under the cursor may have just changed
+        item_id = menu.rows[selected];
         
         if (PAD_justPressed(BTN_B) || (BTN_WAKE!=BTN_MENU && PAD_tappedMenu(now))) {
             status = STATUS_CONT;
             show_menu = 0;
         }
         else if (PAD_justPressed(BTN_A)) {
-            switch(selected) {
+            switch(item_id) {
                 case ITEM_CONT:
                 if (menu.total_discs && rom_disc!=menu.disc) {
                         status = STATUS_DISC;
@@ -4043,46 +5152,51 @@ static void Menu_loop(void) {
                     show_menu = 0;
                 break;
                 
-                case ITEM_SAVE: {
-                    Menu_saveState();
-                    status = STATUS_SAVE;
-                    show_menu = 0;
-                }
-                break;
-                case ITEM_LOAD: {
-                    Menu_loadState();
-                    status = STATUS_LOAD;
-                    show_menu = 0;
+                case ITEM_SAVELOAD: {
+                    // the submenu owns the slot, its thumbnail and the actions;
+                    // it only reports back when something was actually done
+                    int result = Menu_saveLoad(backing);
+                    if (result>=0) {
+                        status = result;
+                        show_menu = 0;
+                    }
+                    dirty = 1;
                 }
                 break;
                 case ITEM_OPTS: {
-                    if (simple_mode) {
-                        core.reset();
-                        status = STATUS_RESET;
-                        show_menu = 0;
-                    }
-                    else {
+                    {
                         int old_scaling = screen_scaling;
                         Menu_options(&options_menu);
+                        Menu_buildRows(); // achievements may have been switched off: Save / Load is back
                         if (screen_scaling!=old_scaling) {
                             selectScaler(renderer.true_w,renderer.true_h,renderer.src_p);
-                        
-                            restore_w = screen->w;
-                            restore_h = screen->h;
-                            restore_p = screen->pitch;
-                            screen = GFX_resize(DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
-                        
-                            SDL_FillRect(backing, NULL, 0);
-                            Menu_scale(menu.bitmap, backing);
+
+                            // the still sits where the game will now
+                            Menu_scaleRect(backing->image.w, backing->image.h, DEVICE_WIDTH, DEVICE_HEIGHT,
+                                           &backing->src, &backing->dst);
                         }
                         dirty = 1;
                     }
                 }
                 break;
+                case ITEM_ACHIEVEMENTS:
+                    // MENU inside the list skips the pause menu entirely
+                    if (Menu_achievementsVisit(backing)) {
+                        status = STATUS_CONT;
+                        show_menu = 0;
+                    }
+                    dirty = 1;
+                break;
                 case ITEM_QUIT:
                     status = STATUS_QUIT;
                     show_menu = 0;
                     quit = 1; // TODO: tmp?
+                break;
+                case ITEM_RESET:
+                    core.reset();
+                    RA_resetRuntime(); // drop any half-satisfied triggers
+                    status = STATUS_RESET;
+                    show_menu = 0;
                 break;
             }
             if (!show_menu) break;
@@ -4091,10 +5205,7 @@ static void Menu_loop(void) {
         PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
         
         if (dirty) {
-            GFX_clear(screen);
-            
-            SDL_BlitSurface(backing, NULL, screen, NULL);
-            SDL_BlitSurface(menu.overlay, NULL, screen, NULL);
+            Menu_blitBackdrop(backing);
 
             int ox, oy;
             int ow = GFX_blitHardwareGroup(screen, show_setting);
@@ -4104,50 +5215,64 @@ static void Menu_loop(void) {
             int text_width = GFX_truncateText(font.large, rom_name, display_name, max_width, SCALE1(BUTTON_PADDING*2));
             max_width = MIN(max_width, text_width);
 
-            SDL_Surface* text;
-            text = TTF_RenderUTF8_Blended(font.large, display_name, COLOR_WHITE);
+            GFX_Text text;
+            text = GFX_renderText(font.large, display_name, COLOR_WHITE);
             GFX_blitPill(ASSET_BLACK_PILL, screen, &(SDL_Rect){
                 SCALE1(PADDING),
                 SCALE1(PADDING),
                 max_width,
                 SCALE1(PILL_SIZE)
             });
-            SDL_BlitSurface(text, &(SDL_Rect){
+            GFX_blitRenderedText(&text, &(SDL_Rect){
                 0,
                 0,
                 max_width-SCALE1(BUTTON_PADDING*2),
-                text->h
-            }, screen, &(SDL_Rect){
-                SCALE1(PADDING+BUTTON_PADDING),
-                SCALE1(PADDING+4)
-            });
-            SDL_FreeSurface(text);
+                text.h
+            }, screen, SCALE1(PADDING+BUTTON_PADDING), SCALE1(PADDING+4));
             
             if (show_setting && !GetHDMI()) GFX_blitHardwareHints(screen, show_setting);
-            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU","SLEEP", NULL }, 0, screen, 0);
-            GFX_blitButtonGroup((char*[]){ "B","BACK", "A","OKAY", NULL }, 1, screen, 1);
+            else GFX_blitButtonGroup((char*[]){ BTN_SLEEP==BTN_POWER?"POWER":"MENU",(char*)T(STR_SLEEP), NULL }, 0, screen, 0);
+            GFX_blitButtonGroup((char*[]){ "B",(char*)T(STR_BACK), "A",(char*)T(STR_MA_OKAY), NULL }, 1, screen, 1);
             
             // list
-            oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (MENU_ITEM_COUNT * PILL_SIZE)) / 2;
-            for (int i=0; i<MENU_ITEM_COUNT; i++) {
-                char* item = menu.items[i];
+            oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (menu.row_count * PILL_SIZE)) / 2;
+            for (int i=0; i<menu.row_count; i++) {
+                int row_id = menu.rows[i];
+                char* item = menu.items[row_id];
                 SDL_Color text_color = COLOR_WHITE;
-                
+
+                // unlocked/total and the percentage, always visible on its row
+                if (row_id==ITEM_ACHIEVEMENTS) {
+                    char progress[RA_SUMMARY_SIZE];
+                    Menu_achievementSummary(progress, sizeof(progress));
+
+                    text = GFX_renderText(font.tiny, progress, COLOR_WHITE);
+                    int row_y = SCALE1(oy + PADDING + (i * PILL_SIZE));
+                    int text_x = screen->w - SCALE1(PADDING + BUTTON_PADDING) - text.w;
+
+                    // left of the tally rather than left of the row name: the
+                    // name sits inside a pill sized to fit it exactly, and an
+                    // icon in there would have to resize it
+                    GFX_blitAsset(ASSET_TROPHY, NULL, screen, &(SDL_Rect){
+                        text_x - SCALE1(RA_ICON_SIZE),
+                        row_y + (SCALE1(PILL_SIZE) - SCALE1(RA_ICON_SIZE)) / 2
+                    });
+                    GFX_blitRenderedText(&text, NULL, screen, text_x, row_y + (SCALE1(PILL_SIZE) - text.h) / 2);
+                }
+
                 if (i==selected) {
                     // disc change
-                    if (menu.total_discs>1 && i==ITEM_CONT) {                
+                    if (menu.total_discs>1 && row_id==ITEM_CONT) {                
                         GFX_blitPill(ASSET_DARK_GRAY_PILL, screen, &(SDL_Rect){
                             SCALE1(PADDING),
                             SCALE1(oy + PADDING),
                             screen->w - SCALE1(PADDING * 2),
                             SCALE1(PILL_SIZE)
                         });
-                        text = TTF_RenderUTF8_Blended(font.large, disc_name, COLOR_WHITE);
-                        SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
-                            screen->w - SCALE1(PADDING + BUTTON_PADDING) - text->w,
-                            SCALE1(oy + PADDING + 4)
-                        });
-                        SDL_FreeSurface(text);
+                        text = GFX_renderText(font.large, disc_name, COLOR_WHITE);
+                        GFX_blitRenderedText(&text, NULL, screen,
+                            screen->w - SCALE1(PADDING + BUTTON_PADDING) - text.w,
+                            SCALE1(oy + PADDING + 4));
                     }
                     
                     TTF_SizeUTF8(font.large, item, &ow, NULL);
@@ -4164,89 +5289,36 @@ static void Menu_loop(void) {
                 }
                 else {
                     // shadow
-                    text = TTF_RenderUTF8_Blended(font.large, item, COLOR_BLACK);
-                    SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                    text = GFX_renderText(font.large, item, COLOR_BLACK);
+                    GFX_blitRenderedText(&text, NULL, screen,
                         SCALE1(2 + PADDING + BUTTON_PADDING),
-                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4)
-                    });
-                    SDL_FreeSurface(text);
+                        SCALE1(1 + PADDING + oy + (i * PILL_SIZE) + 4));
                 }
                 
                 // text
-                text = TTF_RenderUTF8_Blended(font.large, item, text_color);
-                SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){
+                text = GFX_renderText(font.large, item, text_color);
+                GFX_blitRenderedText(&text, NULL, screen,
                     SCALE1(PADDING + BUTTON_PADDING),
-                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4)
-                });
-                SDL_FreeSurface(text);
+                    SCALE1(oy + PADDING + (i * PILL_SIZE) + 4));
             }
             
-            // slot preview
-            if (selected==ITEM_SAVE || selected==ITEM_LOAD) {
-                #define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
-                #define PAGINATION_HEIGHT 6
-                // unscaled
-                int hw = DEVICE_WIDTH / 2;
-                int hh = DEVICE_HEIGHT / 2;
-                int pw = hw + SCALE1(WINDOW_RADIUS*2);
-                int ph = hh + SCALE1(WINDOW_RADIUS*2 + PAGINATION_HEIGHT + WINDOW_RADIUS);
-                ox = DEVICE_WIDTH - pw - SCALE1(PADDING);
-                oy = (DEVICE_HEIGHT - ph) / 2;
-                
-                // window
-                GFX_blitRect(ASSET_STATE_BG, screen, &(SDL_Rect){ox,oy,pw,ph});
-                ox += SCALE1(WINDOW_RADIUS);
-                oy += SCALE1(WINDOW_RADIUS);
-                
-                if (menu.preview_exists) { // has save, has preview
-                    // lotta memory churn here
-                    SDL_Surface* bmp = IMG_Load(menu.bmp_path);
-                    SDL_Surface* raw_preview = SDL_ConvertSurfaceFormat(bmp, SDL_PIXELFORMAT_RGB565, 0);
-                    
-                    //LOG_info("raw_preview %ix%i fixed to RGB565\n", raw_preview->w, raw_preview->h);
-                    
-                    SDL_FillRect(preview, NULL, 0);
-                    Menu_scale(raw_preview, preview);
-                    SDL_SetSurfaceBlendMode(preview, SDL_BLENDMODE_NONE);
-                    SDL_BlitSurface(preview, NULL, screen, &(SDL_Rect){ox,oy});
-                    SDL_FreeSurface(raw_preview);
-                    SDL_FreeSurface(bmp);
-                }
-                else {
-                    SDL_Rect preview_rect = {ox,oy,hw,hh};
-                    SDL_FillRect(screen, &preview_rect, 0);
-                    if (menu.save_exists) GFX_blitMessage(font.large, "No Preview", screen, &preview_rect);
-                    else GFX_blitMessage(font.large, "Empty Slot", screen, &preview_rect);
-                }
-                
-                // pagination
-                ox += (pw-SCALE1(15*MENU_SLOT_COUNT))/2;
-                oy += hh+SCALE1(WINDOW_RADIUS);
-                for (int i=0; i<MENU_SLOT_COUNT; i++) {
-                    if (i==menu.slot)GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15),oy});
-                    else GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15)+4,oy+SCALE1(2)});
-                }
-            }
-    
             GFX_flip(screen);
             dirty = 0;
         }
         else GFX_sync();
     }
     
-    SDL_FreeSurface(preview);
-    
     PAD_reset();
 
-    GFX_clearAll();
+    // On quit the menu stays up: the fade out on exit starts from it
+    if (!quit) GFX_clearAll();
     PWR_warn(1);
     
     if (!quit) {
-        if (restore_w!=DEVICE_WIDTH || restore_h!=DEVICE_HEIGHT) {
-            screen = GFX_resize(restore_w,restore_h,restore_p);
-        }
-        GFX_clear(screen);
-        video_refresh_callback(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
+        // the FBO still holds the core's last frame: nothing has drawn into it since
+        // (renderer.src is RETRO_HW_FRAME_BUFFER_VALID then)
+        if (hwr.active) video_refresh_callback_hw(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
+        else video_refresh_callback(renderer.src, renderer.true_w, renderer.true_h, renderer.src_p);
 
         setOverclock(overclock); // restore overclock value
         if (rumble_strength) VIB_setStrength(rumble_strength);
@@ -4255,9 +5327,9 @@ static void Menu_loop(void) {
         if (!HAS_POWER_BUTTON) PWR_disableSleep();
     }
     
+    Menu_freeShot(backing);
     SDL_FreeSurface(menu.bitmap);
     menu.bitmap = NULL;
-    SDL_FreeSurface(backing);
     PWR_disableAutosleep();
 }
 
@@ -4294,20 +5366,20 @@ static void trackFPS(void) {
         double last_time = (double)(now - sec_start) / 1000;
         fps_double = fps_ticks / last_time;
         cpu_double = cpu_ticks / last_time;
-        use_ticks = getUsage();
-        if (use_ticks && last_use_ticks) {
-            use_double = (use_ticks - last_use_ticks) / last_time;
+        PROF_FP(PROF_FP_FPS, fps_double);
+        if (show_debug) { // a /proc read and parse; only the debug HUD shows it
+            use_ticks = getUsage();
+            if (use_ticks && last_use_ticks) {
+                use_double = (use_ticks - last_use_ticks) / last_time;
+            }
+            last_use_ticks = use_ticks;
         }
-        last_use_ticks = use_ticks;
+        else last_use_ticks = 0; // so turning the HUD on doesn't average over the gap
         sec_start = now;
         cpu_ticks = 0;
         fps_ticks = 0;
         
-        // perf: once per second when MINARCH_FPS_LOG is set. Integer math only: the core's
-        // NEON code leaves the VFP registers dirty, so doubles here come out as nan/inf.
-        static int fps_log = -1;
-        if (fps_log < 0) fps_log = getenv("MINARCH_FPS_LOG") != NULL;
-        if (fps_log) PLAT_perfReport(prevent_tearing);
+         //LOG_info("fps: %f cpu: %f core: %f\n", fps_double, cpu_double, core.fps);
     }
 }
 
@@ -4375,39 +5447,76 @@ int main(int argc , char* argv[]) {
     char tag_name[MAX_PATH];
     char ovlpath[MAX_PATH];
 
-    strcpy(core_path, argv[1]);
-    strcpy(rom_path, argv[2]);
+    // minarch.elf [--32bits] [--gl] <core> <rom>, the options anywhere
+    char* positional[2] = {NULL, NULL};
+    int npositional = 0;
+    for (int i=1; i<argc; i++) {
+        if (!strcmp(argv[i], "--gl")) video_mode |= PLAT_VIDEO_GL | PLAT_VIDEO_32BIT;
+        else if (!strcmp(argv[i], "--32bits")) video_mode |= PLAT_VIDEO_32BIT;
+        else if (!strncmp(argv[i], "--", 2)) LOG_warn("unknown option %s ignored\n", argv[i]);
+        else if (npositional<2) positional[npositional++] = argv[i];
+    }
+    if (npositional<2) {
+        LOG_error("usage: %s [--32bits] [--gl] <core> <rom>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (video_mode) LOG_info("video mode:%s%s\n", (video_mode & PLAT_VIDEO_32BIT) ? " 32bits" : "",
+                             (video_mode & PLAT_VIDEO_GL) ? " gl" : "");
+
+    strcpy(core_path, positional[0]);
+    strcpy(rom_path, positional[1]);
     getEmuName(rom_path, tag_name);
-    
+
+    PLAT_setVideoFlags(video_mode); // before GFX_init: it picks the window's config
     screen = GFX_init(MODE_MENU);
     DEVICE_WIDTH = screen->w; // yea or nay?
     DEVICE_HEIGHT = screen->h; // yea or nay?
-    DEVICE_PITCH = screen->pitch; // yea or nay?
     LOG_info("DEVICE_SIZE: %ix%i (%i)\n", DEVICE_WIDTH,DEVICE_HEIGHT,DEVICE_PITCH);
     
     VIB_init();
     PWR_init();
     if (!HAS_POWER_BUTTON) PWR_disableSleep();
-    MSG_init();
     
     // Overrides_init();
     if (exists_core_overlay(ovlpath)) {
         GFX_initGameOverlay((const char*) ovlpath);
     }
 
-    Core_open(core_path, tag_name);
+    if (!Core_open(core_path, tag_name)) goto finish;
     Game_open(rom_path);
     if (!game.is_open) goto finish;
-    
-    simple_mode = exists(SIMPLE_MODE_PATH);
-    
+
+    // before the config and the achievements: they're set in minui
+    InitSettings();
+    I18N_init();
+    Menu_localize();
+    kids_mode = exists(SIMPLE_MODE_PATH);
+    achievements_enabled = GetRAEnabled();
+    achievement_sound = GetRASound();
+    achievement_notify = GetRANotify();
+
     // restore options
     Config_load();
     Config_init();
     Config_readOptions(); // cores with boot logo option (eg. gb) need to load options early
+
+    // Before Core_load() so the memory map the core reports isn't thrown away.
+    // Switched off (everywhere, or for this game) means we never hash the rom
+    // or parse the set at all. With the global switch off, this game's own
+    // has nothing to do, so it isn't offered.
+    if (!achievements_enabled) config.frontend.options[FE_OPT_ACHIEVEMENTS].lock = 1;
+    if (achievements_enabled && achievements_game) RA_loadForGame();
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);
-    
+
+#if PROFILE && PROFILE_FORCE_NO_VSYNC
+    // With vsync on, every frame is padded out to the refresh interval and the
+    // swap absorbs all the slack, so the totals say 16.7ms no matter what the
+    // renderer costs. Turn it off for measurement runs only.
+    GFX_setVsync(0);
+    LOG_info("PROFILE: vsync forced off for measurement\n");
+#endif
+
     Core_init();
     
     // TODO: find a better place to do this
@@ -4416,14 +5525,14 @@ int main(int argc , char* argv[]) {
     // ah, because it's defined before options_menu...
     options_menu.items[1].desc = (char*)core.version;
     
-    Core_load();
+    if (!Core_load()) goto finish;
     Input_init(NULL);
     Config_readOptions(); // but others load and report options later (eg. nes)
     Config_readControls(); // restore controls (after the core has reported its defaults)
     Config_free();
         
     SND_init(core.sample_rate, core.fps);
-    InitSettings(); // after we initialize audio
+    SetVolume(GetVolume()); // again, now that the audio is open
     Menu_init();
     State_resume();
     Menu_initState(); // make ready for state shortcuts
@@ -4432,14 +5541,23 @@ int main(int argc , char* argv[]) {
     PWR_disableAutosleep();
     sec_start = SDL_GetTicks();
     while (!quit) {
+        PROF_TICK();
+        PROF_BEGIN(PROF_FRAME_TOTAL);
         GFX_startFrame();
         
-        core.run();
+        PROF_BEGIN(PROF_CORE_RUN);
+        PROF_CORE_CALL(Core_run);
+        PROF_END(PROF_CORE_RUN);
+
+        PROF_BEGIN(PROF_RA);
+        RA_doFrame();
+        PROF_END(PROF_RA);
         limitFF();
         
         if (show_menu) Menu_loop();
         
         trackFPS();
+        PROF_END(PROF_FRAME_TOTAL);
         
         // TODO: this is working as expected 
         // but I for some reason kmsdrm isn't ready 
@@ -4458,15 +5576,16 @@ int main(int argc , char* argv[]) {
     
 finish:
 
+    RA_unloadGame();
     Game_close();
     Core_unload();
     
     Core_quit();
+    IO_quit(); // the sram Core_quit just queued, and anything before it
     Core_close();
     
     Config_quit();
     
-    MSG_quit();
     PWR_quit();
     VIB_quit();
     SND_quit();

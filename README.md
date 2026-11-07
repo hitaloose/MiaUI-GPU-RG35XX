@@ -1,10 +1,5 @@
 # 🐱 MiaUI - MinUI + Koriki Hybrid for RG35XX (Old Model)
 
-> **This fork** adds a performance update for MiaUI v1.0.3 (PS1 at a steady 60 FPS, fixes that help
-> every system), installed over an existing setup with the Updater app. See
-> [perf-update/README.md](perf-update/README.md). Original project:
-> [DSkywalk/MiaUI-GPU-RG35XX](https://github.com/DSkywalk/MiaUI-GPU-RG35XX).
-
 MiaUI is the culmination of over 2 years of (interrupted) passionate development. This custom firmware was born from a simple goal: to bring the absolute best of [MinUI](https://github.com/shauninman/MinUI-Legacy-RG35XX) (its elegant, distraction-free interface) and [Koriki / Batocera](https://github.com/rg35xx-cfw/Koriki) (its raw hardware power) into a single distribution for the RG35XX legacy models.
 
 This is a heavily optimized, highly opinionated OS designed to maximize performance and unlock new emulators with an uncompromising approach to SD card preservation.
@@ -96,15 +91,6 @@ To make life easier, 4 standalone utilities are included:
  * Audio Player: Listen to your music with a dedicated battery-saving feature: you can turn the screen completely off while audio continues to play.
 
 <img width="320" alt="MiniVideo Player" src="https://github.com/user-attachments/assets/959a16fe-b8fc-436b-8352-8f4f7532d958" /> <img width="320" alt="MiniMusic Player" src="https://github.com/user-attachments/assets/a2f0b022-8ad9-4113-a5b1-2618d16a225a" />
-
-### Shared conection using NetworkManager (linux)
-```
-  nmcli connection add type ethernet con-name "RG35XX" ifname "*"
-  nmcli connection modify "RG35XX" connection.interface-name ""
-  nmcli connection modify "RG35XX" match.interface-name "enx*" match.driver "rndis_host"
-  nmcli connection modify "RG35XX" ipv4.method shared ipv4.addresses 192.168.23.1/24
-  nmcli connection up "RG35XX"
-```
 
 ## Contributing & Feedback
 This project is a personal hobby and a labor of love for a handheld I truly enjoy. 
