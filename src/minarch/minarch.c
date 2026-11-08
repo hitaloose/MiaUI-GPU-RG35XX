@@ -48,6 +48,7 @@ static int overclock = 1; // normal
 // RetroAchievements, set in minui's Quick Menu: read from msettings at boot
 static int achievements_enabled = 1; // the global switch, set in minui
 static int achievements_game = 1;    // FE_OPT_ACHIEVEMENTS: this game's own, saved with its options
+static int achievements_hardcore = 0; // no save states: decided at launch, like the set itself
 static int achievement_sound = 1;
 static int achievement_notify = 0;   // RA_NOTIFY_ALL
 
@@ -697,6 +698,15 @@ static char* onoff_labels[] = {
     "On",
     NULL
 };
+// "On" follows the global mode: it is what configs saved before the modes hold
+enum { RA_GAME_OFF, RA_GAME_GLOBAL, RA_GAME_HARDCORE, RA_GAME_SOFTCORE };
+static char* achievements_values[] = {
+    "Off",
+    "On",
+    "Hardcore",
+    "Softcore",
+    NULL
+};
 static char* scaling_labels[] = {
     "Native",
     "Aspect",
@@ -1124,12 +1134,12 @@ static struct Config {
             [FE_OPT_ACHIEVEMENTS] = {
                 .key    = "minarch_achievements",
                 .name    = "Achievements",
-                .desc    = "Track RetroAchievements in this game.\nOff brings save states back at once,\nOn applies from the next launch.",
-                .default_value = 1,
-                .value = 1,
-                .count = 2,
-                .values = onoff_labels,
-                .labels = onoff_labels,
+                .desc    = "Global follows the Quick Menu setting.\nOff applies at once,\nthe others from the next launch.",
+                .default_value = RA_GAME_GLOBAL,
+                .value = RA_GAME_GLOBAL,
+                .count = 4,
+                .values = achievements_values,
+                .labels = achievements_values,
             },
             [FE_OPT_COUNT] = {NULL}
         }
@@ -1216,9 +1226,9 @@ static void Config_syncFrontend(char* key, int value) {
     else if (exactMatch(key,config.frontend.options[FE_OPT_ACHIEVEMENTS].key)) {
         achievements_game = value;
         // Off takes effect now: the set goes (its progress flushed if need
-        // be) and with it the hardcore rules, so save states come back. On
-        // waits for the next launch: a state may have been loaded since the
-        // game started, and the core's memory map is only reported at load.
+        // be). On waits for the next launch: a state may have been loaded
+        // since the game started, and the core's memory map is only reported
+        // at load.
         if (!value && RA_isActive()) RA_unloadGame();
         i = FE_OPT_ACHIEVEMENTS;
     }
@@ -1333,6 +1343,22 @@ static void Config_readOptionsString(char* cfg) {
         OptionList_setOptionValue(&config.core, option->key, value);
     }
 }
+static void Config_parseBind(const char* value, int* local, int* mod) {
+    int id = -1;
+    for (int j=0; button_labels[j]; j++) {
+        if (!strcmp(button_labels[j],value)) {
+            id = j - 1;
+            break;
+        }
+    }
+
+    *mod = 0;
+    if (id>=BINDABLE_BUTTON_COUNT) {
+        id -= BINDABLE_BUTTON_COUNT;
+        *mod = 1;
+    }
+    *local = id;
+}
 static void Config_readControlsString(char* cfg) {
     if (!cfg) return;
 
@@ -1399,23 +1425,7 @@ static void Config_readControlsString(char* cfg) {
 
         if (!Config_getValue(cfg, key, value, NULL)) continue;
         
-        int id = -1;
-        for (int j=0; button_labels[j]; j++) {
-            if (!strcmp(button_labels[j],value)) {
-                id = j - 1;
-                break;
-            }
-        }
-        
-        int mod = 0;
-        if (id>=BINDABLE_BUTTON_COUNT) {
-            id -= BINDABLE_BUTTON_COUNT;
-            mod = 1;
-        }
-        // LOG_info("shortcut %s:%s (%i:%i)\n", key,value, id, mod);
-
-        mapping->local = id;
-        mapping->mod = mod;
+        Config_parseBind(value, &mapping->local, &mapping->mod);
     }
 }
 static void Config_load(void) {
@@ -1457,9 +1467,53 @@ static void Config_readOptions(void) {
 
     // screen_scaling = SCALE_NATIVE; // TODO: tmp
 }
+// The shortcuts of Save global. A saved config lists every shortcut, so None
+// there can't mean "chosen": any None takes the global one, unless that button
+// already does something else in this game.
+static struct { int local; int mod; } global_shortcuts[SHORTCUT_COUNT];
+
+static void Config_readGlobalShortcuts(void) {
+    char* cfg = exists(GLOBAL_SHORTCUTS_PATH) ? allocFile(GLOBAL_SHORTCUTS_PATH) : NULL;
+    char key[256];
+    char value[256];
+
+    for (int i=0; i<SHORTCUT_COUNT; i++) {
+        global_shortcuts[i].local = BTN_ID_NONE;
+        global_shortcuts[i].mod = 0;
+        sprintf(key, "bind %s", config.shortcuts[i].name);
+        if (cfg && Config_getValue(cfg, key, value, NULL)) {
+            Config_parseBind(value, &global_shortcuts[i].local, &global_shortcuts[i].mod);
+        }
+    }
+    if (cfg) free(cfg);
+}
+static void Config_applyGlobalShortcuts(void) {
+    for (int i=0; i<SHORTCUT_COUNT; i++) {
+        int local = global_shortcuts[i].local;
+        int mod = global_shortcuts[i].mod;
+        if (local==BTN_ID_NONE || config.shortcuts[i].local!=BTN_ID_NONE) continue;
+
+        int used = 0;
+        for (int j=0; config.shortcuts[j].name; j++) {
+            if (config.shortcuts[j].mod==mod && config.shortcuts[j].local==local) used = 1;
+        }
+        for (int j=0; config.controls[j].name; j++) {
+            if (config.controls[j].mod==mod && config.controls[j].local==local) used = 1;
+        }
+        if (used) continue;
+
+        config.shortcuts[i].local = local;
+        config.shortcuts[i].mod = mod;
+    }
+}
 static void Config_readControls(void) {
     Config_readControlsString(config.default_cfg);
     Config_readControlsString(config.user_cfg);
+    Config_readGlobalShortcuts();
+    Config_applyGlobalShortcuts();
+}
+static int Config_bindLabel(ButtonMapping* mapping) {
+    return mapping->local + 1 + (mapping->mod ? BINDABLE_BUTTON_COUNT : 0);
 }
 static void Config_write(int override) {
     char path[MAX_PATH];
@@ -1506,13 +1560,26 @@ static void Config_write(int override) {
     }
     for (int i=0; config.shortcuts[i].name; i++) {
         ButtonMapping* mapping = &config.shortcuts[i];
-        int j = mapping->local + 1;
-        if (mapping->mod) j += BINDABLE_BUTTON_COUNT;
-        fprintf(file, "bind %s = %s\n", mapping->name, button_labels[j]);
+        // what matches the global one stays None, to keep following it
+        int inherited = mapping->local==global_shortcuts[i].local && mapping->mod==global_shortcuts[i].mod;
+        fprintf(file, "bind %s = %s\n", mapping->name, button_labels[inherited ? 0 : Config_bindLabel(mapping)]);
     }
     
     fclose(file);
     sync();
+}
+static void Config_writeGlobalShortcuts(void) {
+    FILE *file = fopen(GLOBAL_SHORTCUTS_PATH, "wb");
+    if (!file) return;
+
+    for (int i=0; i<SHORTCUT_COUNT; i++) {
+        ButtonMapping* mapping = &config.shortcuts[i];
+        fprintf(file, "bind %s = %s\n", mapping->name, button_labels[Config_bindLabel(mapping)]);
+    }
+
+    fclose(file);
+    sync();
+    Config_readGlobalShortcuts();
 }
 static void Config_restore(void) {
     char path[MAX_PATH];
@@ -1827,9 +1894,7 @@ static void input_poll_callback(void) {
             }
             else if (PAD_justPressed(btn)) {
                 switch (i) {
-                    // no save states while achievements are active, same as
-                    // RetroAchievements hardcore. The menu hides the rows, so
-                    // block the shortcuts too or it's only cosmetic.
+                    // In hardcore the menu hides the rows, so block the shortcuts too.
                     // With a hardware core this runs in the middle of its frame, its
                     // GL state bound: the thumbnail readback would trample it, so in
                     // GL mode both wait for the frame to be handed over.
@@ -3146,19 +3211,23 @@ static struct {
     }
 };
 
-// Achievements imply hardcore rules, the same way RetroAchievements does it:
-// save states are off the table. Battery saves (SRAM) are unaffected.
+// Hardcore rules, the same way RetroAchievements does it: no save states.
+// Softcore keeps them, and loading one re-arms the triggers (Menu_loadState).
+// Battery saves (SRAM) are unaffected either way.
 static int Hardcore_active(void) {
-    return RA_isActive();
+    return RA_isActive() && achievements_hardcore;
 }
 
-// The pause menu is built per game: a game with achievements gets the
-// Achievements row and loses Save / Load, anything else keeps it.
+// The pause menu is built per game. It has room for five rows: a softcore
+// game needs one more, for Achievements next to Save / Load, so it gives up
+// Continue (B does the same).
 static void Menu_buildRows(void) {
     int n = 0;
-    menu.rows[n++] = ITEM_CONT;
-    if (RA_isActive()) menu.rows[n++] = ITEM_ACHIEVEMENTS;
-    else               menu.rows[n++] = ITEM_SAVELOAD;
+    int achievements = RA_isActive();
+    int save_load = !Hardcore_active();
+    if (!(achievements && save_load) || kids_mode) menu.rows[n++] = ITEM_CONT;
+    if (save_load) menu.rows[n++] = ITEM_SAVELOAD;
+    if (achievements) menu.rows[n++] = ITEM_ACHIEVEMENTS;
     if (!kids_mode) menu.rows[n++] = ITEM_OPTS; // scaling, filters, achievements: not for kids
     menu.rows[n++] = ITEM_RESET;
 
@@ -3645,6 +3714,11 @@ static int OptionSaveChanges_onConfirm(MenuList* list, int i) {
             message = (char*)T(STR_MA_SAVED_GAME);
             break;
         }
+        case 2: {
+            Config_writeGlobalShortcuts();
+            message = (char*)T(STR_MA_SAVED_GLOBAL);
+            break;
+        }
         default: {
             Config_restore();
             if (config.loaded) message = (char*)T(STR_MA_RESTORED_CONSOLE);
@@ -3662,6 +3736,7 @@ static MenuList OptionSaveChanges_menu = {
     .items = (MenuItem[]){
         {"Save for console"},
         {"Save for game"},
+        {"Save global"},
         {"Restore defaults"},
         {NULL},
     }
@@ -3856,6 +3931,9 @@ static MenuList options_menu = {
 
 static void Menu_localize(void) {
     #define TS(id) ((char*)T(id))
+    static char* achievements[5];
+    achievements[0] = TS(STR_QM_OFF); achievements[1] = TS(STR_MA_ACH_GLOBAL);
+    achievements[2] = TS(STR_QM_RA_HARDCORE); achievements[3] = TS(STR_QM_RA_SOFTCORE);
     static char* onoff[3], *scaling[5], *sharpness[3], *tearing[4], *sync[3], *overclock[4], *max_ff[9];
     onoff[0] = TS(STR_QM_OFF); onoff[1] = TS(STR_QM_ON);
     scaling[SCALE_NATIVE] = TS(STR_MA_NATIVE); scaling[SCALE_ASPECT] = TS(STR_MA_ASPECT);
@@ -3875,7 +3953,7 @@ static void Menu_localize(void) {
         {FE_OPT_OVERCLOCK, STR_MA_OPT_CPU,       STR_MA_DESC_CPU,       overclock},
         {FE_OPT_DEBUG,     STR_MA_OPT_DEBUG,     STR_MA_DESC_DEBUG,     onoff},
         {FE_OPT_MAXFF,     STR_MA_OPT_MAXFF,     STR_MA_DESC_MAXFF,     max_ff},
-        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_GAME, onoff},
+        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_GAME, achievements},
     };
     for (int i=0; i<(int)(sizeof(fe)/sizeof(fe[0])); i++) {
         Option* option = &config.frontend.options[fe[i].opt];
@@ -3895,7 +3973,8 @@ static void Menu_localize(void) {
     for (int i=0; i<6; i++) options_menu.items[i].name = TS(options_names[i]);
     OptionSaveChanges_menu.items[0].name = TS(STR_MA_SAVE_FOR_CONSOLE);
     OptionSaveChanges_menu.items[1].name = TS(STR_MA_SAVE_FOR_GAME);
-    OptionSaveChanges_menu.items[2].name = TS(STR_MA_RESTORE_DEFAULTS);
+    OptionSaveChanges_menu.items[2].name = TS(STR_MA_SAVE_GLOBAL);
+    OptionSaveChanges_menu.items[3].name = TS(STR_MA_RESTORE_DEFAULTS);
 
     OptionControls_menu.desc = TS(STR_MA_DESC_BIND);
     OptionShortcuts_menu.desc = TS(STR_MA_DESC_BIND);
@@ -4825,6 +4904,7 @@ static void Menu_loadState(void) {
     state_slot = menu.slot;
     putInt(menu.slot_path, menu.slot);
     State_read();
+    RA_resetRuntime(); // the memory just jumped: no trigger may fire on it
 }
 
 ///////////////////////////////////////
@@ -5505,6 +5585,8 @@ int main(int argc , char* argv[]) {
     // or parse the set at all. With the global switch off, this game's own
     // has nothing to do, so it isn't offered.
     if (!achievements_enabled) config.frontend.options[FE_OPT_ACHIEVEMENTS].lock = 1;
+    achievements_hardcore = achievements_game==RA_GAME_HARDCORE ||
+                            (achievements_game==RA_GAME_GLOBAL && exists(RA_HARDCORE_PATH));
     if (achievements_enabled && achievements_game) RA_loadForGame();
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);

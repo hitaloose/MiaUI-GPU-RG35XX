@@ -20,6 +20,8 @@
 #define PAKS_PATH SYSTEM_PATH "/paks"
 #define RECENT_PATH SHARED_USERDATA_PATH "/recent.txt"
 #define SIMPLE_MODE_PATH SHARED_USERDATA_PATH "/enable-simple-mode"
+#define RA_HARDCORE_PATH SHARED_USERDATA_PATH "/ra-hardcore" // achievements on: hardcore, softcore without it
+#define GLOBAL_SHORTCUTS_PATH SHARED_USERDATA_PATH "/shortcuts.cfg" // minarch: Save Changes > Save global
 #define AUTO_RESUME_PATH SHARED_USERDATA_PATH "/auto_resume.txt"
 #define AUTO_RESUME_SLOT 9
 

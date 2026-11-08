@@ -86,10 +86,8 @@ const char* RA_getMessage(void);
 uint32_t RA_getMessageId(void);
 
 // 1 while a game with achievements is loaded. Everything downstream keys off
-// this: the pause menu rows, hardcore, the popups and the per-frame
-// evaluation. Decided once by RA_loadGame() and fixed for the session -- the
-// per-game on/off switch is read at launch and never applied to a running
-// game, or turning it off would hand back the save state menu mid-run.
+// this: the pause menu rows, the popups and the per-frame evaluation. Decided
+// by RA_loadGame(); the per-game switch can only turn it off mid-run.
 int RA_isActive(void);
 
 // Erase every local unlock for this game: forget them, delete the progress

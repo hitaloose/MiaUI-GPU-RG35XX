@@ -937,7 +937,7 @@ static int Collection_set(char *collection_path, char *sd_path, int member)
 }
 
 ///////////////////////////////////////
-// Collection picker (Y on a game): toggle the game in one or more collections.
+// Collection picker (from the Options menu): toggle the game in one or more collections.
 
 #define PICKER_ROWS (MAIN_ROW_COUNT - 1) // first row is the game title
 
@@ -955,13 +955,39 @@ static int picker_start = 0;
 static char *picker_game_path = NULL; // the game being added/removed
 static char *picker_game_name = NULL;
 
-// games: ROMs and ports (.pak folders in /Ports; Tools paks are left out)
-static int Picker_canOpen(Entry *entry)
+static int hasCue(char *dir_path, char *cue_path);
+static int hasM3u(char *rom_path, char *m3u_path);
+
+// Fills out (MAX_PATH) with the path that stands for this entry's game: a ROM
+// (a disc of a multi-disc game counts as its .m3u), a port (.pak folders in
+// /Ports; Tools paks are left out), or a game folder's .cue or .m3u, in the
+// order openDirectory launches them. 0 when the entry isn't a game.
+static int Entry_gamePath(Entry *entry, char *out)
 {
     if (!entry || !Collection_relPath(entry->path))
         return 0;
-    return entry->type == ENTRY_ROM ||
-           (entry->type == ENTRY_PAK && prefixMatch(SDCARD_PATH "/Ports/", entry->path));
+
+    if (entry->type == ENTRY_ROM)
+    {
+        if (suffixMatch(".m3u", entry->path) || !hasM3u(entry->path, out))
+            strcpy(out, entry->path);
+        return 1;
+    }
+    if (entry->type == ENTRY_PAK)
+    {
+        if (!prefixMatch(SDCARD_PATH "/Ports/", entry->path))
+            return 0;
+        strcpy(out, entry->path);
+        return 1;
+    }
+    if (entry->type == ENTRY_DIR && prefixMatch(ROMS_PATH "/", entry->path))
+    {
+        if (hasCue(entry->path, out))
+            return 1;
+        strcpy(strrchr(out, '.') + 1, "m3u"); // hasCue left <dir>/<name>.cue
+        return exists(out);
+    }
+    return 0;
 }
 
 static int CollectionItem_sort(const void *a, const void *b)
@@ -975,10 +1001,14 @@ static int CollectionItem_sort(const void *a, const void *b)
 // later (by hand, over ADB or the web manager) just show up.
 static void Picker_open(Entry *entry)
 {
+    char game_path[MAX_PATH];
+    if (!Entry_gamePath(entry, game_path))
+        return;
+
     picker_items = Array_new();
     picker_selected = 0;
     picker_start = 0;
-    picker_game_path = strdup(entry->path);
+    picker_game_path = strdup(game_path);
     picker_game_name = strdup(entry->unique ? entry->unique : entry->name);
 
     DIR *dh = opendir(COLLECTIONS_PATH);
@@ -1065,13 +1095,18 @@ static int Picker_move(int delta)
     return 1;
 }
 
-// width GFX_blitButtonGroup draws for these {button, hint, ..., NULL} pairs (max 2)
-static int hintGroupWidth(char **pairs)
+// the header of the Picker and Options screens: the entry's name, dimmed
+static void Menu_blitTitle(SDL_Surface *dst, char *name, int hardware_w)
 {
-    int w = SCALE1(BUTTON_MARGIN);
-    for (int i = 0; i < 2 && pairs[i * 2]; i++)
-        w += GFX_getButtonWidth(pairs[i * 2 + 1], pairs[i * 2]) + SCALE1(BUTTON_MARGIN);
-    return w;
+    char text_buf[256];
+    char title[256];
+    snprintf(title, sizeof(title), "%s", name);
+    char *title_name = title;
+    trimSortingMeta(&title_name);
+    int title_w = dst->w - SCALE1(PADDING * 2) - hardware_w;
+    GFX_truncateText(font.large, title_name, text_buf, title_w, SCALE1(BUTTON_PADDING * 2));
+    GFX_Text text = GFX_renderText(font.large, text_buf, COLOR_DARK_TEXT);
+    GFX_blitRenderedText(&text, NULL, dst, SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4));
 }
 
 static void Picker_blitCheckbox(SDL_Surface *dst, int x, int y, int checked, SDL_Color c)
@@ -1091,15 +1126,7 @@ static void Picker_render(SDL_Surface *dst, int hardware_w)
     char text_buf[256];
     int text_x = SCALE1(PADDING + BUTTON_PADDING);
 
-    // title: the game's name, dimmed like a header
-    char title[256];
-    snprintf(title, sizeof(title), "%s", picker_game_name);
-    char *title_name = title;
-    trimSortingMeta(&title_name);
-    int title_w = dst->w - SCALE1(PADDING * 2) - hardware_w;
-    GFX_truncateText(font.large, title_name, text_buf, title_w, SCALE1(BUTTON_PADDING * 2));
-    GFX_Text text = GFX_renderText(font.large, text_buf, COLOR_DARK_TEXT);
-    GFX_blitRenderedText(&text, NULL, dst, text_x, SCALE1(PADDING + 4));
+    Menu_blitTitle(dst, picker_game_name, hardware_w);
 
     if (picker_items->count == 0)
     {
@@ -1123,7 +1150,7 @@ static void Picker_render(SDL_Surface *dst, int hardware_w)
 
         Picker_blitCheckbox(dst, text_x, y + (SCALE1(PILL_SIZE) - box) / 2, item->member, color);
 
-        text = GFX_renderText(font.large, text_buf, color);
+        GFX_Text text = GFX_renderText(font.large, text_buf, color);
         GFX_blitRenderedText(&text, NULL, dst, label_x, y + SCALE1(4));
     }
 
@@ -2181,18 +2208,31 @@ static void closeDirectory(void)
     restore_relative = top->selected;
 }
 
+// opened from a collection: remember the collection, so the menu
+// comes back to it (and not to the ROM's or port's own folder)
+static char *Entry_collectionLast(Entry *self, char *last_path, size_t size)
+{
+    if (!prefixMatch(COLLECTIONS_PATH, top->path) || (self->type != ENTRY_ROM && self->type != ENTRY_PAK))
+        return NULL;
+    char *tmp = strrchr(self->path, '/');
+    snprintf(last_path, size, "%s/%s", top->path, tmp ? tmp + 1 : self->path);
+    return last_path;
+}
+
+// Launches a multi-disc game on the given disc
+static void Entry_openDisc(Entry *self, char *disc_path)
+{
+    char last_path[256];
+    char *last = Entry_collectionLast(self, last_path, sizeof(last_path));
+    if (!last && self->type == ENTRY_DIR)
+        last = self->path; // as openDirectory does, back to the game's folder entry
+    openRom(disc_path, last);
+}
+
 static void Entry_open(Entry *self)
 {
-    // opened from a collection: remember the collection, so the menu
-    // comes back to it (and not to the ROM's or port's own folder)
-    char *last = NULL;
     char last_path[256];
-    if (prefixMatch(COLLECTIONS_PATH, top->path) && (self->type == ENTRY_ROM || self->type == ENTRY_PAK))
-    {
-        char *tmp = strrchr(self->path, '/');
-        snprintf(last_path, sizeof(last_path), "%s/%s", top->path, tmp ? tmp + 1 : self->path);
-        last = last_path;
-    }
+    char *last = Entry_collectionLast(self, last_path, sizeof(last_path));
 
     if (self->type == ENTRY_ROM)
     {
@@ -2422,6 +2462,277 @@ static void NekoBit_navigate(NB_Target *target)
 }
 
 ///////////////////////////////////////
+// Options menu (Y): everything that can be done with the selected entry.
+// The list never changes; what doesn't apply is dimmed and the cursor skips it.
+
+enum
+{
+    OPT_OPEN,
+    OPT_RESUME,
+    OPT_DISC,
+    OPT_LISTS,
+    OPT_NEKOBIT,
+    OPT_DELETE,
+    OPT_SLEEP,
+    OPT_COUNT,
+    OPT_NONE = -1,
+};
+
+enum
+{
+    OPTIONS_MAIN,
+    OPTIONS_DISCS,
+    OPTIONS_CONFIRM,
+};
+
+static const struct
+{
+    int label;
+    char *badge; // the button or shortcut that also does it, drawn before the label
+} option_rows[OPT_COUNT] = {
+    [OPT_OPEN] = {STR_OPT_OPEN, NULL},
+    [OPT_RESUME] = {STR_OPT_RESUME, NULL},
+    [OPT_DISC] = {STR_OPT_DISC, NULL},
+    [OPT_LISTS] = {STR_OPT_LISTS, "Y"},
+    [OPT_NEKOBIT] = {STR_OPT_NEKOBIT, NULL},
+    [OPT_DELETE] = {STR_OPT_DELETE, "MENU+SELECT+START"},
+    [OPT_SLEEP] = {STR_OPT_SLEEP, "POWER"},
+};
+
+static int show_options = 0;
+static struct
+{
+    int screen;
+    int active[OPT_COUNT];
+    int selected;
+    int start;
+    int disc_selected;
+    int disc_start;
+    Array *discs; // Entry*, of a multi-disc game
+    char title[256];
+} options;
+
+// the next active row from `from`, in the direction of delta. NekoBit and
+// Sleep are always active, so there always is one.
+static int Options_next(int from, int delta)
+{
+    int i = from;
+    do
+    {
+        i = (i + delta + OPT_COUNT) % OPT_COUNT;
+    } while (!options.active[i]);
+    return i;
+}
+
+// Only a plain ROM file in a system's folder: a collection would only lose
+// the line, a Recents entry is a shortcut and remove() can't take folders.
+static int Options_canDelete(Entry *entry)
+{
+    char m3u_path[MAX_PATH];
+    return entry && entry->type == ENTRY_ROM && prefixMatch(ROMS_PATH "/", top->path) &&
+           !suffixMatch(".m3u", entry->path) && !hasM3u(entry->path, m3u_path);
+}
+
+// entry: the selected one, NULL on an empty list
+static void Options_open(Entry *entry)
+{
+    memset(&options, 0, sizeof(options));
+    if (entry)
+        snprintf(options.title, sizeof(options.title), "%s", entry->unique ? entry->unique : entry->name);
+    else
+        snprintf(options.title, sizeof(options.title), "%s", top->name);
+
+    char game_path[MAX_PATH];
+    int is_game = Entry_gamePath(entry, game_path);
+    if (is_game && suffixMatch(".m3u", game_path))
+        options.discs = getDiscs(game_path);
+
+    options.active[OPT_OPEN] = entry != NULL;
+    options.active[OPT_RESUME] = entry != NULL && can_resume;
+    options.active[OPT_DISC] = options.discs && options.discs->count > 1;
+    options.active[OPT_LISTS] = is_game;
+    options.active[OPT_NEKOBIT] = 1;
+    options.active[OPT_DELETE] = Options_canDelete(entry);
+    options.active[OPT_SLEEP] = 1;
+    options.selected = Options_next(OPT_COUNT - 1, 1);
+    show_options = 1;
+}
+
+static void Options_close(void)
+{
+    if (options.discs)
+        EntryArray_free(options.discs);
+    options.discs = NULL;
+    show_options = 0;
+}
+
+static void Options_moveMain(int delta)
+{
+    int first = Options_next(OPT_COUNT - 1, 1);
+    options.selected = Options_next(options.selected, delta);
+    if (options.selected == first)
+        options.start = 0; // the dimmed rows above it stay in view
+    else if (options.selected < options.start)
+        options.start = options.selected;
+    else if (options.selected >= options.start + PICKER_ROWS)
+        options.start = options.selected - PICKER_ROWS + 1;
+}
+
+static void Options_moveDisc(int delta)
+{
+    int count = options.discs->count;
+    options.disc_selected = (options.disc_selected + delta + count) % count;
+    if (options.disc_selected < options.disc_start)
+        options.disc_start = options.disc_selected;
+    else if (options.disc_selected >= options.disc_start + PICKER_ROWS)
+        options.disc_start = options.disc_selected - PICKER_ROWS + 1;
+}
+
+// After PAD_poll, while open. Returns the action to carry out (the OPT_* row;
+// OPT_DISC with options.disc_selected, OPT_DELETE once confirmed) or OPT_NONE.
+static int Options_input(int *dirty)
+{
+    if (options.screen == OPTIONS_CONFIRM)
+    {
+        if (PAD_justPressed(BTN_A))
+            return OPT_DELETE;
+        if (PAD_justPressed(BTN_B))
+        {
+            options.screen = OPTIONS_MAIN;
+            *dirty = 1;
+        }
+        return OPT_NONE;
+    }
+
+    if (options.screen == OPTIONS_DISCS)
+    {
+        if (PAD_justPressed(BTN_A))
+            return OPT_DISC;
+        if (PAD_justPressed(BTN_B))
+        {
+            options.screen = OPTIONS_MAIN;
+            *dirty = 1;
+        }
+        else if (PAD_justRepeated(BTN_UP))
+        {
+            Options_moveDisc(-1);
+            *dirty = 1;
+        }
+        else if (PAD_justRepeated(BTN_DOWN))
+        {
+            Options_moveDisc(1);
+            *dirty = 1;
+        }
+        return OPT_NONE;
+    }
+
+    if (PAD_justPressed(BTN_B))
+    {
+        Options_close();
+        *dirty = 1;
+    }
+    else if (PAD_justPressed(BTN_Y) && options.active[OPT_LISTS])
+    {
+        return OPT_LISTS;
+    }
+    else if (PAD_justPressed(BTN_A))
+    {
+        if (options.selected == OPT_DISC)
+            options.screen = OPTIONS_DISCS;
+        else if (options.selected == OPT_DELETE)
+            options.screen = OPTIONS_CONFIRM;
+        else
+            return options.selected;
+        *dirty = 1;
+    }
+    else if (PAD_justRepeated(BTN_UP))
+    {
+        Options_moveMain(-1);
+        *dirty = 1;
+    }
+    else if (PAD_justRepeated(BTN_DOWN))
+    {
+        Options_moveMain(1);
+        *dirty = 1;
+    }
+    return OPT_NONE;
+}
+
+// row j (1 is the first under the title), with its badge before the label
+static void Options_blitRow(SDL_Surface *dst, int j, char *label, char *badge, int is_selected, int active)
+{
+    char text_buf[256];
+    int y = SCALE1(PADDING + j * PILL_SIZE);
+    int pill_x = SCALE1(PADDING);
+    int text_x = SCALE1(PADDING + BUTTON_PADDING);
+    SDL_Color color = is_selected ? COLOR_BLACK : active ? COLOR_WHITE : COLOR_DARK_TEXT;
+
+    // the button: white as in the footer; dark on the selected (white) row
+    // and on a dimmed one, where only its outline should show
+    GFX_Text key = {0};
+    int badge_w = 0;
+    if (badge)
+    {
+        int single = strlen(badge) == 1;
+        SDL_Color key_color = !active ? COLOR_DARK_TEXT : is_selected ? COLOR_WHITE : COLOR_BUTTON_TEXT;
+        key = GFX_renderText(single ? font.medium : font.tiny, badge, key_color);
+        badge_w = SCALE1(BUTTON_SIZE) + (single ? 0 : key.w - SCALE1(BUTTON_SIZE) / 2);
+    }
+    int label_x = text_x + (badge ? badge_w + SCALE1(BUTTON_MARGIN) : 0);
+    int max_w = dst->w - SCALE1(PADDING * 2) - (label_x - text_x);
+
+    int label_w = GFX_truncateText(font.large, label, text_buf, max_w, SCALE1(BUTTON_PADDING * 2));
+    if (is_selected)
+        GFX_blitPill(ASSET_WHITE_PILL, dst, &(SDL_Rect){pill_x, y, (label_x - text_x) + label_w, SCALE1(PILL_SIZE)});
+
+    if (badge)
+    {
+        int badge_y = y + SCALE1(BUTTON_MARGIN);
+        SDL_Rect badge_rect = {text_x, badge_y, badge_w, SCALE1(BUTTON_SIZE)};
+        if (active && !is_selected)
+            GFX_blitPill(ASSET_BUTTON, dst, &badge_rect);
+        else
+            GFX_blitPillOutline(dst, &badge_rect, 0, (SDL_Color){TRIAD_DARK_GRAY}, (SDL_Color){TRIAD_DARK_GRAY});
+        GFX_blitRenderedText(&key, NULL, dst, text_x + (badge_w - key.w) / 2, badge_y + (SCALE1(BUTTON_SIZE) - key.h) / 2);
+    }
+
+    GFX_Text text = GFX_renderText(font.large, text_buf, color);
+    GFX_blitRenderedText(&text, NULL, dst, label_x, y + SCALE1(4));
+}
+
+static void Options_render(SDL_Surface *dst, int hardware_w)
+{
+    Menu_blitTitle(dst, options.title, hardware_w);
+
+    if (options.screen == OPTIONS_CONFIRM)
+    {
+        char name[256];
+        GFX_truncateText(font.large, options.title, name, dst->w - SCALE1(PADDING * 2), SCALE1(BUTTON_PADDING * 2));
+        char msg[512];
+        snprintf(msg, sizeof(msg), T(STR_OPT_DELETE_ASK), name);
+        GFX_blitMessage(font.large, msg, dst, &(SDL_Rect){0, 0, dst->w, dst->h});
+        GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), "A", (char *)T(STR_OPT_DELETE_BTN), NULL}, 1, dst, 1);
+        return;
+    }
+
+    if (options.screen == OPTIONS_DISCS)
+    {
+        for (int i = options.disc_start, j = 1; i < options.discs->count && j <= PICKER_ROWS; i++, j++)
+        {
+            Entry *disc = options.discs->items[i];
+            Options_blitRow(dst, j, disc->name, NULL, i == options.disc_selected, 1);
+        }
+    }
+    else
+    {
+        for (int i = options.start, j = 1; i < OPT_COUNT && j <= PICKER_ROWS; i++, j++)
+            Options_blitRow(dst, j, (char *)T(option_rows[i].label), option_rows[i].badge, i == options.selected, options.active[i]);
+    }
+
+    GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), "A", (char *)T(STR_NB_OK), NULL}, 1, dst, 1);
+}
+
+///////////////////////////////////////
 // Quick Menu
 
 #define SDTOOL_PAK_PATH SDCARD_PATH "/Tools/1) System [DRK]/SD Tool.pak"
@@ -2542,7 +2853,7 @@ int main(int argc, char *argv[])
         if (QM_update())
             dirty = 1;
 
-        int nb = NBUI_update(now, stack->count == 1 && !QM_isOpen() && !NBUI_isOpen() && !show_picker);
+        int nb = NBUI_update(now, stack->count == 1 && !QM_isOpen() && !NBUI_isOpen() && !show_picker && !show_options);
         if (nb & NBUI_REDRAW)
             dirty = 1;
         if (nb & NBUI_SUMMONED) // NekoBit is fully out: now the overlay
@@ -2565,6 +2876,49 @@ int main(int argc, char *argv[])
                 NekoBit_navigate(&action.target);
                 update_timer = now;
                 if (top->entries->count > 0)
+                    readyResume(top->entries->items[top->selected]);
+            }
+        }
+        else if (show_options)
+        {
+            int action = Options_input(&dirty);
+            if (action != OPT_NONE)
+            {
+                Entry *entry = total > 0 ? top->entries->items[top->selected] : NULL;
+                char disc_path[MAX_PATH] = {0};
+                if (action == OPT_DISC)
+                    strcpy(disc_path, ((Entry *)options.discs->items[options.disc_selected])->path);
+                Options_close();
+                update_timer = now;
+
+                switch (action)
+                {
+                case OPT_OPEN:
+                case OPT_RESUME:
+                    should_resume = action == OPT_RESUME;
+                    Entry_open(entry);
+                    break;
+                case OPT_DISC:
+                    Entry_openDisc(entry, disc_path);
+                    break;
+                case OPT_LISTS:
+                    Picker_open(entry);
+                    break;
+                case OPT_NEKOBIT:
+                    NekoBit_open();
+                    break;
+                case OPT_DELETE:
+                    deleteCurrentEntry(top, top->selected);
+                    update_timer = SDL_GetTicks();
+                    break;
+                case OPT_SLEEP:
+                    PWR_fauxSleep();
+                    break;
+                }
+
+                total = top->entries->count;
+                dirty = 1;
+                if (total > 0)
                     readyResume(top->entries->items[top->selected]);
             }
         }
@@ -2795,6 +3149,7 @@ int main(int argc, char *argv[])
             else if (total > 0 && PAD_justPressed(BTN_A))
             {
                 update_timer = now;
+                should_resume = can_resume; // the footer says RESUME; Options has Open
                 Entry_open(top->entries->items[top->selected]);
                 total = top->entries->count;
                 dirty = 1;
@@ -2802,9 +3157,9 @@ int main(int argc, char *argv[])
                 if (total > 0)
                     readyResume(top->entries->items[top->selected]);
             }
-            else if (total > 0 && PAD_justPressed(BTN_Y) && Picker_canOpen(top->entries->items[top->selected]))
+            else if (PAD_justPressed(BTN_Y))
             {
-                Picker_open(top->entries->items[top->selected]);
+                Options_open(total > 0 ? top->entries->items[top->selected] : NULL);
                 dirty = 1;
             }
             else if (PAD_justPressed(BTN_B) && stack->count > 1)
@@ -2944,6 +3299,15 @@ int main(int argc, char *argv[])
                             *dot = '\0';
 
                         snprintf(thumbpath, sizeof(thumbpath), "%s/.media/%s.png", rompath, res_copy);
+
+                        // a game folder listed by its .m3u or .cue (collections,
+                        // Recents): its art sits next to the folder
+                        char *folder = strrchr(rompath, '/');
+                        if (entry->type == ENTRY_ROM && (suffixMatch(".m3u", entry->path) || suffixMatch(".cue", entry->path)) &&
+                            folder && exactMatch(folder + 1, res_copy) && !exists(thumbpath))
+                        {
+                            snprintf(thumbpath, sizeof(thumbpath), "%.*s/.media/%s.png", (int)(folder - rompath), rompath, res_copy);
+                        }
                     }
                 }
 
@@ -2966,12 +3330,18 @@ int main(int argc, char *argv[])
 
             // the folder background goes under everything, the battery and
             // brightness pill included (it used to be drawn over them)
-            if (!QM_isOpen() && !NBUI_isOpen() && !show_picker)
+            if (!QM_isOpen() && !NBUI_isOpen() && !show_picker && !show_options)
                 Art_draw(shown_bg, 0, 0);
 
             int ow = GFX_blitHardwareGroup(screen, show_setting);
 
-            if (show_picker)
+            if (show_options)
+            {
+                Options_render(screen, ow);
+                if (show_setting && !GetHDMI())
+                    GFX_blitHardwareHints(screen, show_setting);
+            }
+            else if (show_picker)
             {
                 Picker_render(screen, ow);
                 if (show_setting && !GetHDMI())
@@ -3066,42 +3436,14 @@ int main(int argc, char *argv[])
                     GFX_blitMessage(font.large, (char *)T(STR_EMPTY_FOLDER), screen, &(SDL_Rect){0, 0, screen->w, screen->h});
                 }
 
-                // buttons
-                // Y LISTS is shown next to RESUME or MENU INFO when both groups
-                // still fit on one line; otherwise RESUME wins over Y, Y over INFO.
-                int can_collect = total > 0 && Picker_canOpen(top->entries->items[top->selected]);
-                char *left_hints[5] = {NULL};
-                if (can_resume)
-                {
-                    left_hints[0] = "X";
-                    left_hints[1] = (char *)T(STR_RESUME);
-                }
-                else
-                {
-                    left_hints[0] = BTN_SLEEP == BTN_POWER ? "POWER" : "MENU";
-                    left_hints[1] = (char *)(BTN_SLEEP == BTN_POWER || simple_mode ? T(STR_SLEEP) : T(STR_INFO));
-                }
-                if (can_collect)
-                {
-                    left_hints[2] = "Y";
-                    left_hints[3] = (char *)T(STR_LISTS);
-                    char *right_hints[] = {"B", (char *)T(STR_BACK), "A", (char *)T(STR_OPEN), NULL};
-                    int fits = hintGroupWidth(left_hints) + hintGroupWidth(stack->count > 1 ? right_hints : right_hints + 2) + SCALE1(PADDING * 3) <= screen->w;
-                    if (!fits && can_resume)
-                        left_hints[2] = NULL;
-                    else if (!fits)
-                    {
-                        left_hints[0] = "Y";
-                        left_hints[1] = (char *)T(STR_LISTS);
-                        left_hints[2] = NULL;
-                    }
-                }
+                // buttons: always Y OPTIONS, B BACK and A; everything else is in Options
+                char *a_hint = (char *)(can_resume ? T(STR_RESUME) : T(STR_OPEN));
 
                 int lw = screen->w; // the left group's width: NekoBit's pill keeps clear of it
                 if (show_setting && !GetHDMI())
                     GFX_blitHardwareHints(screen, show_setting);
                 else
-                    lw = GFX_blitButtonGroup(left_hints, 0, screen, 0);
+                    lw = GFX_blitButtonGroup((char *[]){"Y", (char *)T(STR_OPTIONS), NULL}, 0, screen, 0);
 
                 if (total == 0)
                 {
@@ -3114,11 +3456,11 @@ int main(int argc, char *argv[])
                 {
                     if (stack->count > 1)
                     {
-                        GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), "A", (char *)T(STR_OPEN), NULL}, 1, screen, 1);
+                        GFX_blitButtonGroup((char *[]){"B", (char *)T(STR_BACK), "A", a_hint, NULL}, 1, screen, 1);
                     }
                     else
                     {
-                        int bw = GFX_blitButtonGroup((char *[]){"A", (char *)T(STR_OPEN), NULL}, 0, screen, 1);
+                        int bw = GFX_blitButtonGroup((char *[]){"A", a_hint, NULL}, 0, screen, 1);
                         if (stack->count == 1) // NekoBit lives on the root menu, between the two groups
                             NBUI_drawFace(screen, SCALE1(PADDING + BUTTON_MARGIN) + lw, screen->w - SCALE1(PADDING + BUTTON_MARGIN) - bw);
                     }

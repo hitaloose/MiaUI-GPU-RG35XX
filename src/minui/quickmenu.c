@@ -72,6 +72,9 @@ static const int auto_sleep_minutes[] = {0, 1, 2, 5, 10}; // GetAutoSleep()
 #define AUTO_SLEEP_COUNT 5
 #define SLEEP_OFF_COUNT 3 // 5, 10, 15 minutes: GetSleepPowerOff()
 static const int notify_labels[] = {STR_QM_NOTIFY_ALL, STR_QM_NOTIFY_UNLOCKS, STR_QM_NOTIFY_GENERAL, STR_QM_OFF};
+
+enum { RA_MODE_OFF, RA_MODE_HARDCORE, RA_MODE_SOFTCORE, RA_MODE_COUNT };
+static const int ra_mode_labels[RA_MODE_COUNT] = {STR_QM_OFF, STR_QM_RA_HARDCORE, STR_QM_RA_SOFTCORE};
 #define NOTIFY_COUNT 4
 // the date next to the time: a flat battery puts the clock back to 1970, and
 // seeing the year is what tells
@@ -295,6 +298,17 @@ static int qm_rows(int screen, int* rows) {
     return n;
 }
 
+static int qm_raMode(void) {
+    if (!GetRAEnabled()) return RA_MODE_OFF;
+    return exists(RA_HARDCORE_PATH) ? RA_MODE_HARDCORE : RA_MODE_SOFTCORE;
+}
+
+static void qm_setRaMode(int mode) {
+    SetRAEnabled(mode != RA_MODE_OFF);
+    if (mode == RA_MODE_HARDCORE) putFile(RA_HARDCORE_PATH, "");
+    else unlink(RA_HARDCORE_PATH);
+}
+
 static int qm_rowLabel(int screen, int row) {
     switch (screen) {
     case SCR_SETTINGS: {
@@ -336,7 +350,7 @@ static int qm_valueCount(int screen, int row) {
         case SET_KIDS: return 2;
         }
         return 0; // Reset NekoBit only does something
-    case SCR_ACHIEVEMENTS: return row == RA_NOTIFY ? NOTIFY_COUNT : 2;
+    case SCR_ACHIEVEMENTS: return row == RA_NOTIFY ? NOTIFY_COUNT : row == RA_ENABLED ? RA_MODE_COUNT : 2;
     case SCR_NETWORK: return 3; // see qm_valueText
     }
     return 0;
@@ -355,7 +369,7 @@ static int qm_valueIndex(int screen, int row) {
         return 0;
     case SCR_ACHIEVEMENTS:
         switch (row) {
-        case RA_ENABLED: return GetRAEnabled() ? 1 : 0;
+        case RA_ENABLED: return qm_raMode();
         case RA_SOUND: return GetRASound() ? 1 : 0;
         }
         return qm_min(qm_max(GetRANotify(), 0), NOTIFY_COUNT - 1);
@@ -383,6 +397,7 @@ static void qm_valueText(int screen, int row, int i, char* out, size_t size) {
         break;
     case SCR_ACHIEVEMENTS:
         if (row == RA_NOTIFY) snprintf(out, size, "%s", T(notify_labels[i]));
+        else if (row == RA_ENABLED) snprintf(out, size, "%s", T(ra_mode_labels[i]));
         else snprintf(out, size, "%s", T(i ? STR_QM_ON : STR_QM_OFF));
         break;
     case SCR_NETWORK: {
@@ -427,7 +442,7 @@ static void qm_change(int screen, int row, int dir) {
         break;
     case SCR_ACHIEVEMENTS:
         switch (row) {
-        case RA_ENABLED: SetRAEnabled(!GetRAEnabled()); break;
+        case RA_ENABLED: qm_setRaMode(qm_wrap(qm_raMode() + dir, RA_MODE_COUNT)); break;
         case RA_SOUND: SetRASound(!GetRASound()); break;
         case RA_NOTIFY: SetRANotify(qm_wrap(GetRANotify() + dir, NOTIFY_COUNT)); break;
         }
