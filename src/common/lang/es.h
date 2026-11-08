@@ -7,6 +7,10 @@
 [STR_SLEEP] = "REPOSO",
 [STR_INFO] = "INFO",
 [STR_EMPTY_FOLDER] = "Carpeta vacía",
+[STR_LISTS] = "LISTAS",
+[STR_ADD] = "AÑADIR",
+[STR_REMOVE] = "QUITAR",
+[STR_NO_COLLECTIONS] = "Aún no hay colecciones:\ncréalas en Tools > Collections",
 
 // Quick Menu
 [STR_QM_SETTINGS] = "Ajustes",

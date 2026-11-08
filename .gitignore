@@ -22,3 +22,6 @@ tools
 src/minui/tests/
 *.patch
 *busybox-*
+
+perf-update/cache
+perf-update/output
