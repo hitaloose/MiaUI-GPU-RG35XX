@@ -66,6 +66,7 @@ static const char* ra_titleForId(uint32_t id);
 static RA_Achievement* ra_findById(uint32_t id);
 static int ra_isBaseSet(const rc_api_achievement_definition_t* ach);
 static void ra_countPoints(void); // defined with the achievement list
+static int ra_softcore; static void ra_sc_loadProgress(const char* emu_tag); // [softcore] ra_softcore.inc
 
 static struct {
     rc_runtime_t runtime;
@@ -921,7 +922,7 @@ int RA_loadGame(const char* emu_tag, const char* rom_path, const void* rom_data,
     snprintf(ra.progress_path, sizeof(ra.progress_path),
              "%s/%s_progress.json", progress_dir, ra.hash);
     if (isArcadeTag(emu_tag) && !ra_fileExists(ra.progress_path)) ra_adoptArcadeProgress(emu_tag);
-    ra_loadProgress();
+    if (ra_softcore) ra_sc_loadProgress(emu_tag); else ra_loadProgress(); // [softcore]
 
     // 5. arm the runtime with everything still locked
     rc_runtime_init(&ra.runtime);
@@ -1100,3 +1101,5 @@ void RA_refreshProgress(void) {
                                                ach->progress, sizeof(ach->progress));
     }
 }
+
+#include "ra_softcore.inc" // [softcore]

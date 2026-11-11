@@ -19,6 +19,7 @@
 #include "i18n.h"
 #include "nekobit.h"
 #include "quickmenu.h"
+#include "softcore.h" // [softcore]
 
 // The one way the USB port is set up: usbnet.sh <adb|adbnet|net|off>. It
 // tears the old mode down safely, so modes switch live, takes a few seconds,
@@ -344,7 +345,7 @@ static int qm_rowDesc(int screen, int row) {
         return ids[row];
     }
     case SCR_ACHIEVEMENTS: {
-        static const int ids[RA_COUNT] = {STR_QM_DESC_RA_ENABLED, STR_QM_DESC_RA_SOUND, STR_QM_DESC_RA_NOTIFY};
+        static const int ids[RA_COUNT] = {STR_QM_DESC_RA_MODE, STR_QM_DESC_RA_SOUND, STR_QM_DESC_RA_NOTIFY};
         return ids[row];
     }
     }
@@ -364,7 +365,7 @@ static int qm_valueCount(int screen, int row) {
         case SET_KIDS: return 2;
         }
         return 0; // Reset NekoBit only does something
-    case SCR_ACHIEVEMENTS: return row == RA_NOTIFY ? NOTIFY_COUNT : 2;
+    case SCR_ACHIEVEMENTS: return row == RA_NOTIFY ? NOTIFY_COUNT : row == RA_ENABLED ? SC_MODE_COUNT : 2; // [softcore]
     case SCR_NETWORK: return 3; // see qm_valueText
     }
     return 0;
@@ -383,7 +384,7 @@ static int qm_valueIndex(int screen, int row) {
         return 0;
     case SCR_ACHIEVEMENTS:
         switch (row) {
-        case RA_ENABLED: return GetRAEnabled() ? 1 : 0;
+        case RA_ENABLED: return SC_raMode(); // [softcore]
         case RA_SOUND: return GetRASound() ? 1 : 0;
         }
         return qm_min(qm_max(GetRANotify(), 0), NOTIFY_COUNT - 1);
@@ -411,6 +412,7 @@ static void qm_valueText(int screen, int row, int i, char* out, size_t size) {
         break;
     case SCR_ACHIEVEMENTS:
         if (row == RA_NOTIFY) snprintf(out, size, "%s", T(notify_labels[i]));
+        else if (row == RA_ENABLED) snprintf(out, size, "%s", T(SC_modeLabel(i))); // [softcore]
         else snprintf(out, size, "%s", T(i ? STR_QM_ON : STR_QM_OFF));
         break;
     case SCR_NETWORK: {
@@ -455,7 +457,7 @@ static void qm_change(int screen, int row, int dir) {
         break;
     case SCR_ACHIEVEMENTS:
         switch (row) {
-        case RA_ENABLED: SetRAEnabled(!GetRAEnabled()); break;
+        case RA_ENABLED: SC_setRaMode(qm_wrap(SC_raMode() + dir, SC_MODE_COUNT)); break; // [softcore]
         case RA_SOUND: SetRASound(!GetRASound()); break;
         case RA_NOTIFY: SetRANotify(qm_wrap(GetRANotify() + dir, NOTIFY_COUNT)); break;
         }

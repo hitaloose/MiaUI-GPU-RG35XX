@@ -344,3 +344,5 @@ X(STR_NB_FACT_57, "Chrono Trigger's dream team included creators of Final Fantas
 X(STR_NB_FACT_58, "Tamagotchi virtual pets were banned in many schools in the 90s for being too distracting.")
 X(STR_NB_FACT_59, "The NES Power Pad began life as Bandai's 'Family Trainer' in Japan.")
 X(STR_NB_FACT_LAST, "Neko means cat in Japanese. NekoBit has nine lives, but only one save file!")
+
+#include "i18n_fork.h" // [softcore]

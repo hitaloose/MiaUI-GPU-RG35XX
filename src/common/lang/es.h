@@ -320,3 +320,5 @@
 [STR_MA_ACH_UNLOCKED] = "--- desbloqueados ---",
 [STR_MA_ACH_ERASE] = "¿Borrar todo el progreso de\nlogros de este juego?\n\nNo se puede deshacer.",
 [STR_MA_ACH_ERASED] = "Progreso de logros borrado",
+
+#include "es_fork.h" // [softcore]

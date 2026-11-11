@@ -240,6 +240,7 @@ static int Zip_inflate(FILE* zip, FILE* dst, size_t size) { // compressed
 ///////////////////////////////////////
 
 #include "ra_offline.h"
+#include "ra_softcore.h" // [softcore]
 #include "profile.h"
 
 static struct Game {
@@ -1127,9 +1128,9 @@ static struct Config {
                 .desc    = "Track RetroAchievements in this game.\nOff brings save states back at once,\nOn applies from the next launch.",
                 .default_value = 1,
                 .value = 1,
-                .count = 2,
-                .values = onoff_labels,
-                .labels = onoff_labels,
+                .count = SC_GAME_COUNT, // [softcore]
+                .values = SC_game_values,
+                .labels = SC_game_values,
             },
             [FE_OPT_COUNT] = {NULL}
         }
@@ -3210,18 +3211,21 @@ static struct {
 // Achievements imply hardcore rules, the same way RetroAchievements does it:
 // save states are off the table. Battery saves (SRAM) are unaffected.
 static int Hardcore_active(void) {
-    return RA_isActive();
+    return RA_isActive() && !RA_isSoftcore(); // [softcore]
 }
 
 // The pause menu is built per game: a game with achievements gets the
 // Achievements row and loses Save / Load, anything else keeps it.
 static void Menu_buildRows(void) {
     int n = 0;
-    menu.rows[n++] = ITEM_CONT;
+    // [softcore] five rows fit: Softcore wants Save / Load and Achievements, so
+    // it gives up Continue (B does the same), or Reset when Continue changes discs
+    int sc = RA_isSoftcore() && !kids_mode, discs = menu.total_discs>1;
+    if (!sc || discs) menu.rows[n++] = ITEM_CONT;
     if (RA_isActive()) menu.rows[n++] = ITEM_ACHIEVEMENTS;
-    else               menu.rows[n++] = ITEM_SAVELOAD;
+    if (!Hardcore_active()) menu.rows[n++] = ITEM_SAVELOAD;
     if (!kids_mode) menu.rows[n++] = ITEM_OPTS; // scaling, filters, achievements: not for kids
-    menu.rows[n++] = ITEM_RESET;
+    if (!sc || !discs) menu.rows[n++] = ITEM_RESET;
 
     menu.rows[n++] = ITEM_QUIT;
 
@@ -3926,6 +3930,7 @@ static void Menu_localize(void) {
     sync[0] = TS(STR_MA_VIDEO); sync[1] = TS(STR_MA_AUDIO);
     overclock[0] = TS(STR_MA_POWERSAVE); overclock[1] = TS(STR_MA_NORMAL); overclock[2] = TS(STR_MA_PERFORMANCE);
     max_ff[0] = TS(STR_MA_NONE);
+    SC_localize(); // [softcore]
     for (int i=1; i<8; i++) max_ff[i] = max_ff_labels[i]; // 2x..8x
 
     static const struct { int opt; int name; int desc; char** labels; } fe[] = {
@@ -3936,7 +3941,7 @@ static void Menu_localize(void) {
         {FE_OPT_OVERCLOCK, STR_MA_OPT_CPU,       STR_MA_DESC_CPU,       overclock},
         {FE_OPT_DEBUG,     STR_MA_OPT_DEBUG,     STR_MA_DESC_DEBUG,     onoff},
         {FE_OPT_MAXFF,     STR_MA_OPT_MAXFF,     STR_MA_DESC_MAXFF,     max_ff},
-        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_GAME, onoff},
+        {FE_OPT_ACHIEVEMENTS, STR_QM_ACHIEVEMENTS, STR_MA_DESC_ACH_MODE, SC_game_labels}, // [softcore]
     };
     for (int i=0; i<(int)(sizeof(fe)/sizeof(fe[0])); i++) {
         Option* option = &config.frontend.options[fe[i].opt];
@@ -5566,6 +5571,7 @@ int main(int argc , char* argv[]) {
     // or parse the set at all. With the global switch off, this game's own
     // has nothing to do, so it isn't offered.
     if (!achievements_enabled) config.frontend.options[FE_OPT_ACHIEVEMENTS].lock = 1;
+    RA_setSoftcore(SC_gameSoftcore(achievements_game)); // [softcore]
     if (achievements_enabled && achievements_game) RA_loadForGame();
     setOverclock(overclock);
     GFX_setVsync(prevent_tearing);
